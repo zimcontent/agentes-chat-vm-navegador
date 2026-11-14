@@ -1,0 +1,272 @@
+From e0280e28494200498f6969e74cc9e1681a1d5e4b Mon Sep 17 00:00:00 2001
+From: Gabriel Zim <235131889+zimcontent@users.noreply.github.com>
+Date: Sat, 14 Nov 2026 01:16:17 +0000
+Subject: [PATCH 6/6] fix(runner): a press that opens a window hears of its
+ release
+
+A click on something that calls window.open (a "Continue with Google"
+button) answered "CDP command timed out: Input.dispatchMouseEvent" 30 s
+later, though it had landed. The runner's traffic counter asked for
+Target.setAutoAttach at the browser's level, and while any client does
+so Chrome never acknowledges the release of a press that opens a window.
+
+The counter now asks to be told of targets (Target.setDiscoverTargets)
+and attaches to each page, extension page, service worker and shared
+worker itself (Target.attachToTarget, flat). Frames and dedicated
+workers are still auto-attached under their page, which holds nothing.
+What each session gets is unchanged, the password guard included.
+
+The same click now takes 0.8 s. ADR 0040 section 20.
+
+Co-Authored-By: Claude Fable 5.2 <noreply@anthropic.com>
+---
+ apps/server/runner/browser-traffic.ts         | 48 +++++++++++++++----
+ .../test/runner/browser-traffic.test.ts       | 41 ++++++++++++----
+ apps/server/test/runner/browser.test.ts       | 15 +++---
+ docs/adr/0040-agent-browser.md                |  9 +++-
+ 4 files changed, 89 insertions(+), 24 deletions(-)
+
+diff --git a/apps/server/runner/browser-traffic.ts b/apps/server/runner/browser-traffic.ts
+index 4510730c9..20cb05b2e 100644
+--- a/apps/server/runner/browser-traffic.ts
++++ b/apps/server/runner/browser-traffic.ts
+@@ -9,6 +9,15 @@ import { urlCarries } from "./vault";
+  * left out and nothing paused, with network events on and no bodies kept for
+  * us. Never the rest of the computer, never a URL or a header kept or logged.
+  *
++ * At the browser's level it attaches to each target Chrome tells it of
++ * (`Target.setDiscoverTargets`, then `Target.attachToTarget`), never with
++ * `Target.setAutoAttach` there: measured on Chrome 156 with `agent-browser`
++ * 0.39.1, while any client auto-attaches at the browser's level, a press that
++ * opens a new window (`window.open`) never hears of its release, and the
++ * agent's click answered "CDP command timed out" 30 s later though it had
++ * landed. Under a page its frames and workers are still auto-attached, which
++ * does not do that.
++ *
+  * - Received: each finished response's encoded size (headers included); for
+  *   one that failed, what had arrived; nothing for a response a service worker
+  *   served (the worker's own fetch is counted on its target).
+@@ -42,19 +51,22 @@ import { urlCarries } from "./vault";
+  * one, so a sign-in page with it could never be guarded otherwise.
+  */
+ 
+-const AUTO_ATTACH = {
+-  autoAttach: true,
+-  waitForDebuggerOnStart: false,
+-  flatten: true,
++/** What Chrome tells of at the browser's level: every target but its own UI and the tabs' wrappers. */
++const DISCOVER = {
++  discover: true,
+   filter: [{ type: "browser_ui", exclude: true }, { type: "tab", exclude: true }, {}],
+ };
++/** The targets attached at the browser's level. A frame or a dedicated worker is attached under its page instead. */
++const TOP_LEVEL = new Set(["page", "background_page", "webview", "service_worker", "shared_worker"]);
+ /**
+  * Under a page, frame or worker: its frames and dedicated workers. Service and shared workers are the
+  * browser's own targets, attached once above: attached again under each page they serve, their bytes would
+  * count twice (a service worker's fetch did).
+  */
+ const AUTO_ATTACH_RELATED = {
+-  ...AUTO_ATTACH,
++  autoAttach: true,
++  waitForDebuggerOnStart: false,
++  flatten: true,
+   filter: [{ type: "service_worker", exclude: true }, { type: "shared_worker", exclude: true }, {}],
+ };
+ /** Bodies never cross the socket, and Chrome buffers none of them for this client. */
+@@ -84,7 +96,7 @@ export interface ArmedGuard {
+ }
+ 
+ export interface TrafficCounter {
+-  /** Settles once Chrome answered the first auto-attach, or the socket failed. */
++  /** Settles once Chrome told of the targets it has and each was attached (or couldn't be), or the socket failed. */
+   attached: Promise<void>;
+   /** The bytes counted since the last call. */
+   take(): { up: number; down: number };
+@@ -270,6 +282,13 @@ export function countChromeTraffic(
+     show: (url) => send("Page.navigate", { url }, sessionId),
+   });
+   let first = 0;
++  /** Chrome answered `first`: it has told of every target it had then. */
++  let discovered = false;
++  /** Targets asked to be attached and not answered yet. */
++  let attaching = 0;
++  const ready = () => {
++    if (discovered && attaching === 0) settle();
++  };
+   /** Dedicated workers: no `Fetch` to enable there. */
+   const workers = new Set<string>();
+   const targets = () => [...sessions.keys()].filter((id) => id !== "" && !workers.has(id));
+@@ -363,7 +382,10 @@ export function countChromeTraffic(
+       return;
+     }
+     if (!isObject(msg)) return;
+-    if (msg.id === first) settle();
++    if (msg.id === first) {
++      discovered = true;
++      ready();
++    }
+     if (typeof msg.id === "number") {
+       const then = answers.get(msg.id);
+       answers.delete(msg.id);
+@@ -376,6 +398,16 @@ export function countChromeTraffic(
+     const p = isObject(msg.params) ? msg.params : {};
+     const sessionId = typeof msg.sessionId === "string" ? msg.sessionId : "";
+     switch (msg.method) {
++      case "Target.targetCreated": {
++        const target = isObject(p.targetInfo) ? p.targetInfo : {};
++        if (sessionId || typeof target.targetId !== "string" || !TOP_LEVEL.has(String(target.type))) return;
++        attaching++;
++        send("Target.attachToTarget", { targetId: target.targetId, flatten: true }, undefined, undefined, () => {
++          attaching--;
++          ready();
++        });
++        return;
++      }
+       case "Target.attachedToTarget": {
+         if (typeof p.sessionId !== "string") return;
+         sessions.set(p.sessionId, new Map());
+@@ -458,7 +490,7 @@ export function countChromeTraffic(
+   try {
+     socket = open(wsUrl);
+     socket.onopen = () => {
+-      first = send("Target.setAutoAttach", AUTO_ATTACH);
++      first = send("Target.setDiscoverTargets", DISCOVER);
+     };
+     socket.onmessage = (event) => onMessage(event.data);
+     socket.onerror = () => settle();
+diff --git a/apps/server/test/runner/browser-traffic.test.ts b/apps/server/test/runner/browser-traffic.test.ts
+index a8e02d28b..32329e773 100644
+--- a/apps/server/test/runner/browser-traffic.test.ts
++++ b/apps/server/test/runner/browser-traffic.test.ts
+@@ -47,19 +47,20 @@ function counter(onCrash?: (page: CrashedPage) => void) {
+   return { c, cdp };
+ }
+ 
+-const AUTO_ATTACH = {
+-  autoAttach: true,
+-  waitForDebuggerOnStart: false,
+-  flatten: true,
++/** At the browser's level: told of every target but Chrome's own UI and the tabs' wrappers. */
++const DISCOVER = {
++  discover: true,
+   filter: [{ type: "browser_ui", exclude: true }, { type: "tab", exclude: true }, {}],
+ };
+ /** Under a target: never the service and shared workers the browser level already attached (counted once). */
+ const RELATED = {
+-  ...AUTO_ATTACH,
++  autoAttach: true,
++  waitForDebuggerOnStart: false,
++  flatten: true,
+   filter: [{ type: "service_worker", exclude: true }, { type: "shared_worker", exclude: true }, {}],
+ };
+ 
+-test("one socket to the browser endpoint: auto-attach without pausing, then network events with no bodies on every session", async () => {
++test("one socket to the browser endpoint: each target attached as Chrome tells of it, never auto-attached there, then network events with no bodies on every session", async () => {
+   const { c, cdp } = counter();
+   expect(cdp.url).toBe("ws://127.0.0.1:9222/devtools/browser/abc");
+   let attached = false;
+@@ -67,11 +68,29 @@ test("one socket to the browser endpoint: auto-attach without pausing, then netw
+     attached = true;
+   });
+   cdp.onopen?.();
+-  expect(cdp.sent).toEqual([{ id: 1, method: "Target.setAutoAttach", params: AUTO_ATTACH }]);
++  expect(cdp.sent).toEqual([{ id: 1, method: "Target.setDiscoverTargets", params: DISCOVER }]);
++  // The targets Chrome has: a tab and a service worker are attached; a frame and a dedicated worker come under
++  // their page, and the browser itself is not a target of ours.
++  const created = (targetId: string, type: string) =>
++    cdp.event("Target.targetCreated", { targetInfo: { targetId, type, url: "" } });
++  created("tab-0", "page");
++  created("frame-0", "iframe");
++  created("worker-0", "worker");
++  created("browser-0", "browser");
++  created("sw-0", "service_worker");
++  expect(cdp.sent.slice(1)).toEqual([
++    { id: 2, method: "Target.attachToTarget", params: { targetId: "tab-0", flatten: true } },
++    { id: 3, method: "Target.attachToTarget", params: { targetId: "sw-0", flatten: true } },
++  ]);
++  // Not attached until Chrome answered for each of them: a first command's bytes are counted.
++  cdp.reply(1);
++  cdp.reply(2);
+   await Bun.sleep(5);
+   expect(attached).toBe(false);
+-  cdp.reply(1);
++  // One that went away meanwhile answers with an error, and isn't waited for.
++  cdp.onmessage?.({ data: JSON.stringify({ id: 3, error: { message: "No target with given id found" } }) });
+   await c.attached;
++  cdp.sent.splice(1, 2);
+   // A page, then a frame and a worker inside it: each gets the same, on its own session.
+   cdp.attach("page-1");
+   cdp.event(
+@@ -90,7 +109,11 @@ test("one socket to the browser endpoint: auto-attach without pausing, then netw
+     { method: "Target.setAutoAttach", params: RELATED, sessionId: "worker-1" },
+   ]);
+   // It never resumes or pauses a target, and asks for nothing else.
+-  expect(new Set(cdp.sent.map((m) => m.method))).toEqual(new Set(["Target.setAutoAttach", "Network.enable"]));
++  expect(new Set(cdp.sent.map((m) => m.method))).toEqual(
++    new Set(["Target.setDiscoverTargets", "Target.setAutoAttach", "Network.enable"]),
++  );
++  // Auto-attach only under a target: at the browser's level it holds the release of a press that opens a window.
++  expect(cdp.sent.every((m) => m.method !== "Target.setAutoAttach" || m.sessionId)).toBe(true);
+   expect(cdp.sent.every((m) => m.method !== "Network.enable" || m.sessionId)).toBe(true);
+ });
+ 
+diff --git a/apps/server/test/runner/browser.test.ts b/apps/server/test/runner/browser.test.ts
+index d88f6f9a7..2327fd012 100644
+--- a/apps/server/test/runner/browser.test.ts
++++ b/apps/server/test/runner/browser.test.ts
+@@ -1398,14 +1398,17 @@ function fakeDevtools(down: number[], answer: (reply: () => void) => void = (rep
+         const event = (method: string, params: object, sessionId?: string) =>
+           ws.send(JSON.stringify({ method, params, ...(sessionId ? { sessionId } : {}) }));
+         const result = (r: object) => ws.send(JSON.stringify({ id: msg.id, result: r }));
+-        if (msg.method === "Target.setAutoAttach" && !msg.sessionId) {
++        if (msg.method === "Target.setDiscoverTargets") {
+           answer(() => {
++            event("Target.targetCreated", { targetInfo: { type: "page", targetId: `tab-${n}` } });
+             result({});
+-            event("Target.attachedToTarget", {
+-              sessionId: `page-${n}`,
+-              targetInfo: { type: "page", targetId: `tab-${n}` },
+-            });
+           });
++        } else if (msg.method === "Target.attachToTarget") {
++          event("Target.attachedToTarget", {
++            sessionId: `page-${n}`,
++            targetInfo: { type: "page", targetId: `tab-${n}` },
++          });
++          result({});
+         } else if (msg.method === "Network.enable") {
+           event(
+             "Network.requestWillBeSentExtraInfo",
+@@ -1452,7 +1455,7 @@ test.if(posix)("a new Chrome's first command waits for its traffic counter to at
+   try {
+     const t = setup({ startChrome: chromesAt(held).start });
+     const opened = t.act("open", ["https://a.example/"]);
+-    await waitFor(() => held.asked.includes("Target.setAutoAttach"));
++    await waitFor(() => held.asked.includes("Target.setDiscoverTargets"));
+     await Bun.sleep(300);
+     expect(t.logged()).toEqual([]);
+     reply();
+diff --git a/docs/adr/0040-agent-browser.md b/docs/adr/0040-agent-browser.md
+index cfabd28eb..1c9d5b4dd 100644
+--- a/docs/adr/0040-agent-browser.md
++++ b/docs/adr/0040-agent-browser.md
+@@ -251,7 +251,14 @@ On one computer over a day, 17% of the agents' clicks and 41% of their fills ans
+ - It never fails a command. A look that can't be read, or a tab still hidden after it was brought up, is left for 30 s: on an agent's desktop a minimized window comes back up, and one that can't show is not asked at every command.
+ - `tab`, `wait`, `dialog` and the page size are not preceded by it.
+ 
+-Not covered here: a click that opens a new window answers after 30 s ("CDP command timed out: Input.dispatchMouseEvent") while the runner's traffic counter is attached with `Target.setAutoAttach` on the browser (5 of the same 61). Measured: with target discovery and `Target.attachToTarget` in its place the same press takes 0.1 s. That connection also guards typed passwords (ADR 0144), so it changes on its own.
++### 20. A press that opens a window hears of its release (2026-11-14)
++
++A click on something that opens a new window (`window.open`: a "Continue with Google" button) answered "CDP command timed out: Input.dispatchMouseEvent" 30 s later, though it had landed (5 of the 61 slow ones of section 19, by their time). The runner's own connection to each Chrome (its traffic counter, which also tells of a page that died and guards a typed password, ADR 0144) asked for `Target.setAutoAttach` at the browser's level. Measured on Chrome 156 with `agent-browser` 0.39.1: while any client auto-attaches there, even one that leaves pages out and pauses nothing, the release of a press that opens a window is never answered; with none, or with one that only asks to be told of targets, it is answered in 0.1 s.
++
++- At the browser's level the runner asks to be told of targets (`Target.setDiscoverTargets`, Chrome's own UI and the tabs' wrappers left out) and attaches to each page, extension page, service worker and shared worker itself (`Target.attachToTarget`, flat). Frames and dedicated workers are still auto-attached under their page, as before: that does not hold a release.
++- What each session gets is unchanged (network events, the password guard's pause, the page size, the auto-attach under it), and so is what the guard waits for: a page that opens while a password is guarded is paused once it is attached, which neither way does before its first request.
++- The counter is attached once Chrome told of the targets it has and answered for each: a first command still waits for that.
++- The same click now takes 0.8 s.
+ 
+ ## Order
+ 
+-- 
+2.43.0
+

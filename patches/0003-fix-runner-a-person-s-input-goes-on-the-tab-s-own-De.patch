@@ -1,0 +1,754 @@
+From 370aac707e1419a0a12971cab357c81a5bc0ddb9 Mon Sep 17 00:00:00 2001
+From: Gabriel Zim <info@zimcontent.com>
+Date: Fri, 13 Nov 2026 09:39:24 -0300
+Subject: [PATCH 3/6] fix(runner): a person's input goes on the tab's own
+ DevTools socket
+
+With a person in control, each click or key went through agent-browser's
+relay (POST /api/command), which runs inside the daemon behind the same
+lock as its commands. The daemon holds that lock for its own upkeep too
+(every 100 ms it applies what Chrome told it; each cross-origin frame
+that attaches, such as a Cloudflare check, is prepared there with calls
+in series that may wait 30 s). On such a page every input waited 5 s and
+failed: "this didn't reach the page".
+
+While a person drives, the runner opens the active tab's DevTools socket
+(the target from the stream's tab list) and sends the input there, as the
+same calls agent-browser makes (mouse, insertText, keys, chords with
+their codes, the field check). The first frame of the live view in that
+mode comes from there too. The relay stays the fallback when the socket
+does not open. ADR 0040 section 17.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ CLAUDE.md                               |   2 +-
+ apps/server/runner/browser.ts           | 398 ++++++++++++++++++++++--
+ apps/server/test/runner/browser.test.ts | 156 ++++++++++
+ docs/adr/0040-agent-browser.md          |   8 +
+ 4 files changed, 535 insertions(+), 29 deletions(-)
+
+diff --git a/CLAUDE.md b/CLAUDE.md
+index 8d65074b1..608946dc6 100644
+--- a/CLAUDE.md
++++ b/CLAUDE.md
+@@ -84,7 +84,7 @@ Run lint, typecheck, tests and boundaries before declaring work done.
+ - Phone app (ADR 0035): app sessions = no `Origin` + `X-Agentes-Client: mobile` + cookie (`requestOriginAllowed` in `routes/app/context.ts`, also the WS upgrade), Expo and Apple sign-in in `auth.ts`, a provider's sign-in through the phone's browser tied to the app by a challenge and a one-time code in `phone-browser-sign-in.ts` (app side `apps/mobile/src/lib/auth.ts` `signInWithBrowser`); push = `push_devices`, `packages/engine/src/push.ts` (`push.send` job, enqueued from `notify`) + `push-messages.ts` (pt-BR/en text), `PushSender` in `packages/adapters/src/push.ts` (`createPhonePushSender`: Android straight to FCM `push-fcm.ts` or through the push relay `push-relay.ts` per `PUSH_SENDER`, the relay's side in `packages/engine/src/push-relay.ts` and `apps/server/src/routes/push-relay.ts` with `PUSH_RELAY_SERVE`, ADR 0152; iPhones through Expo), routes `routes/app/push.ts`; account deletion `deleteAccount` (`organizations.ts`) at `DELETE /api/app/account`; glass chat header `apps/mobile/src/features/chat/HeaderPill.tsx`; connectors `src/features/connectors/*` with OAuth handed back to the app (`packages/engine/src/connectors/oauth-return.ts`, `POST …/connectors/oauth/complete`); links that open the app `apps/server/src/app-links.ts` (`/.well-known/*`), invitation/reset/first run `src/features/auth/InviteScreen.tsx`, `ResetPasswordScreen.tsx`, `src/features/onboarding/*`.
+ - Browser push (ADR 0071): Web Push with the server's own VAPID pair in `instance_push` (`packages/engine/src/web-push.ts`, sender + RFC 8291/8292 in `packages/adapters/src/web-push.ts`), `web` rows in `push_devices` belonging to their session (`session_id`, deleted with it; forgotten by `POST /api/app/push/devices/forget`), sent by `deliverPush` (`push.ts`, also the 45 s hold while the person is in the app; a refused signature keeps the row), the contact in `vapidSubject`, the sender wired in `apps/server/src/start.ts` (`webPushSender`: DNS errors retry, refusals logged), service worker `apps/web/public/sw.js` (served by `/sw.js` in `app.ts`), page side `apps/web/src/lib/web-push.ts` + `components/WebPush.tsx` (account menu switch, never in the desktop app), clicks `lib/push-open.ts` + `components/NotificationOpen.tsx`; clear on read via realtime and `POST /api/app/push/stale` (`stalePushNotifications`).
+ - Desktop app main window (ADR 0036): the window loads the site itself, no app commands (`apps/desktop/src-tauri/src/main_window.rs`, `capabilities/main.json`); web side `apps/web/src/lib/desktop.ts`, `DesktopTitleBar.tsx`, `desktop.css`; Google/Apple sign-in through the browser = Better Auth plugin `apps/server/src/desktop-sign-in.ts` (`/api/auth/desktop/handoff` + `/redeem`, verifier/challenge) and route `desktop.sign-in.tsx`. "This Mac" bridge: `this_mac` (Rust checks + relays) → popover `apps/desktop/src/control/this-mac.ts`; web `ThisMac.tsx`. Menus: menu bar + system-drawn right click `apps/desktop/src-tauri/src/menus.rs` (labels from the popover); the right-click engine `apps/web/src/lib/context-menu.ts` (our `MenuAt` or the system's), host `components/DesktopMenus.tsx`. A connector's OAuth started in the window comes back through `agenteschat://desktop/connectors/oauth` (`packages/engine/src/connectors/oauth-return.ts` `desktop:` returns; `deep_link.rs` → web route `desktop.connector.tsx`).
+-- Agent browser (ADR 0040) and the screen layer (ADR 0054): tools `packages/engine/src/browser/tools.ts` (`browser_do` plans, targets in words, every action answers with what changed), the browser as a surface `browser/surface.ts` (settle + look; `browser.batch`/`browser.capture` on protocol 17, one `browser.act` at a time before); surface-agnostic layer for computer use `packages/engine/src/screen/*` (`observation.ts` snapshot → elements and diffs, `targets.ts` ref → exact → site memory → judge Choice → Jev Box on an image, `checks.ts` expect/until/find/dismiss, `plan.ts` `runPlan`, `report.ts`); images and Box questions in `judge.ts` (`JEV_VISION_MODEL`); runner `apps/server/runner/browser.ts`. Live view sockets (§7.1, protocol 49): the computer's data socket per watched browser `runner/browser-views.ts` (`BrowserViews`, `browser.view.open`, root's in system mode), frame bytes `encodeBrowserFrame` in `machine-protocol.ts` (apps' copy `packages/client/src/browser/frame-bytes.ts`), the broker hands it over (`StreamBrokerDeps.claim` → `claimView` in `browser/live.ts`), each person's frame socket `/api/browser/frames` (ticket, `createViewerPacer`) in `apps/server/src/realtime/ws.ts`, opened by `RealtimeConnection` (rates per view in `browser/watches.ts`; the phone stays on base64, `browserFrameSockets: false`); runner source pacing `pacing=ack` + `browser.room` (system mode); web `components/browser/LivePicture.tsx`. Desktop computer use (ADR 0062) reuses the layer: `ScreenSurface.kind` ("screen" in plans and reports), desktop verbs (`focus` on windows only, `double_click`, `right_click`, `drag`, `type`, `open` with `app`/`path`), `capture(region)` + `regions` for the close-up Box on small targets, `dismiss: false` (a covering dialog stops the plan); the runner's desktop helper `apps/server/runner/desktop-helper.py` (AT-SPI tree, xdotool input, pastes, XDamage settle and scrot as the agent's user, JSON lines, run as `python3 -I -c <source>`; types and command in `desktop-helper.ts`, Python tests `apps/server/test/runner/test_desktop_helper.py`, recorded snapshots in `test/runner/fixtures/desktop/`); the snapshot as screen text in `desktop-tree.ts` (`desktopLook`: occlusion, the agent browser as one line, escaped and redacted names and text, refs that stay; `observation.ts` reads a ref only from the brackets after the role and name); protocol 21 (`desktop.look`/`act`/`capture`/`apps`, `hello.desktopUse`) served by `desktop.ts` (`DesktopManager`: one helper per agent, only where this process is the agent's own OS user (`ownUserRefusal`), an action checked against fresh extents and the window stack, then input, settle and a look in one op, session-ending targets refused, idle stop, restarts), routed in `handlers.ts` behind the `desktop` and `commands` switches; in system mode they are the agent's worker's ops (`OP_ROUTES`), which gets the desktop from the supervisor (`WorkerLink.desktop` → `desktop.ensure`, answered only while it serves a desktop use request, or with `use: "browser"` a browser command the server put on the desktop); `desktop-check` times it (as the agent's user through its launcher in system mode). Engine side `packages/engine/src/desktop/*`: `tools.ts` (`createDesktopToolSource`: `desktop_do` plans, `desktop_read`, `desktop_screenshot` under `desktop:use`, offered and allowed on each call only with Run code, the org's code environment on and a computer serving desktop use; screen text in `untrustedBlock`; `dismiss: false`; a person in control holds it), `status.ts` (`agentDesktopUseStatus`), `surface.ts` (the desktop as a `ScreenSurface`, apps by name `pickApp`, web addresses refused for `browser_do`). The steps go on the message as `meta.desktop.steps` (`run-tools.ts` `desktopTrail` → `executor.ts`; client `desktopTrailOf`; web `BrowserTrailCard` with `screen="desktop"`), apps and files a plan opens in the audit log (`desktop.app_opened`, `desktop.file_opened`); whether a computer serves it on its page (`components/desktop/MachineDesktopUseCard.tsx`) and the agent's Work tab; eval `bun run eval:desktop:micro` (`packages/engine/eval/desktop/`, recorded scenes in `fixtures/`).
++- Agent browser (ADR 0040) and the screen layer (ADR 0054): tools `packages/engine/src/browser/tools.ts` (`browser_do` plans, targets in words, every action answers with what changed), the browser as a surface `browser/surface.ts` (settle + look; `browser.batch`/`browser.capture` on protocol 17, one `browser.act` at a time before); surface-agnostic layer for computer use `packages/engine/src/screen/*` (`observation.ts` snapshot → elements and diffs, `targets.ts` ref → exact → site memory → judge Choice → Jev Box on an image, `checks.ts` expect/until/find/dismiss, `plan.ts` `runPlan`, `report.ts`); images and Box questions in `judge.ts` (`JEV_VISION_MODEL`); runner `apps/server/runner/browser.ts`. Live view sockets (§7.1, protocol 49): the computer's data socket per watched browser `runner/browser-views.ts` (`BrowserViews`, `browser.view.open`, root's in system mode), frame bytes `encodeBrowserFrame` in `machine-protocol.ts` (apps' copy `packages/client/src/browser/frame-bytes.ts`), the broker hands it over (`StreamBrokerDeps.claim` → `claimView` in `browser/live.ts`), each person's frame socket `/api/browser/frames` (ticket, `createViewerPacer`) in `apps/server/src/realtime/ws.ts`, opened by `RealtimeConnection` (rates per view in `browser/watches.ts`; the phone stays on base64, `browserFrameSockets: false`); runner source pacing `pacing=ack` + `browser.room` (system mode); a person in control types and clicks on the active tab's own DevTools socket, out of the daemon's lock (`PageLink`, `pageCalls`, §17); web `components/browser/LivePicture.tsx`. Desktop computer use (ADR 0062) reuses the layer: `ScreenSurface.kind` ("screen" in plans and reports), desktop verbs (`focus` on windows only, `double_click`, `right_click`, `drag`, `type`, `open` with `app`/`path`), `capture(region)` + `regions` for the close-up Box on small targets, `dismiss: false` (a covering dialog stops the plan); the runner's desktop helper `apps/server/runner/desktop-helper.py` (AT-SPI tree, xdotool input, pastes, XDamage settle and scrot as the agent's user, JSON lines, run as `python3 -I -c <source>`; types and command in `desktop-helper.ts`, Python tests `apps/server/test/runner/test_desktop_helper.py`, recorded snapshots in `test/runner/fixtures/desktop/`); the snapshot as screen text in `desktop-tree.ts` (`desktopLook`: occlusion, the agent browser as one line, escaped and redacted names and text, refs that stay; `observation.ts` reads a ref only from the brackets after the role and name); protocol 21 (`desktop.look`/`act`/`capture`/`apps`, `hello.desktopUse`) served by `desktop.ts` (`DesktopManager`: one helper per agent, only where this process is the agent's own OS user (`ownUserRefusal`), an action checked against fresh extents and the window stack, then input, settle and a look in one op, session-ending targets refused, idle stop, restarts), routed in `handlers.ts` behind the `desktop` and `commands` switches; in system mode they are the agent's worker's ops (`OP_ROUTES`), which gets the desktop from the supervisor (`WorkerLink.desktop` → `desktop.ensure`, answered only while it serves a desktop use request, or with `use: "browser"` a browser command the server put on the desktop); `desktop-check` times it (as the agent's user through its launcher in system mode). Engine side `packages/engine/src/desktop/*`: `tools.ts` (`createDesktopToolSource`: `desktop_do` plans, `desktop_read`, `desktop_screenshot` under `desktop:use`, offered and allowed on each call only with Run code, the org's code environment on and a computer serving desktop use; screen text in `untrustedBlock`; `dismiss: false`; a person in control holds it), `status.ts` (`agentDesktopUseStatus`), `surface.ts` (the desktop as a `ScreenSurface`, apps by name `pickApp`, web addresses refused for `browser_do`). The steps go on the message as `meta.desktop.steps` (`run-tools.ts` `desktopTrail` → `executor.ts`; client `desktopTrailOf`; web `BrowserTrailCard` with `screen="desktop"`), apps and files a plan opens in the audit log (`desktop.app_opened`, `desktop.file_opened`); whether a computer serves it on its page (`components/desktop/MachineDesktopUseCard.tsx`) and the agent's Work tab; eval `bun run eval:desktop:micro` (`packages/engine/eval/desktop/`, recorded scenes in `fixtures/`).
+ - Databases (ADR 0039, read-only Postgres): driver `packages/adapters/src/database.ts`; `packages/engine/src/databases/*` (connections + pool, per-agent rules, `guard.ts` with libpg-query, `pg_<slug>_*` tools); routes `apps/server/src/routes/app/databases.ts`; web `DatabaseConnect.tsx`, `DatabaseRules.tsx`, agent page `DatabaseAccess.tsx`.
+ - Team actions (ADR 0064): every outside action (gateway `external`, approved actions, computer commands that leave the machine) is a `team_actions` row with normalized targets, searchable (kind `action`); before the next one on the same target the gateway holds the call once and tells the agent (`team_action_checks`, shown under the reply via `meta.teamChecks`); workspace switch `organization_settings.action_check`. All in `packages/engine/src/team-actions.ts`, hooked in `tools/gateway.ts`; web `components/TeamChecks.tsx`.
+ - Dashboards and widgets (ADR 0135): schema `packages/db/src/schema/dashboards.ts` (`dashboards` with each person's `home` board, `dashboard_widgets`, `dashboard_widget_updates`; migration 0199); the block, checked once for every package, `packages/ui/src/widgets/spec.ts` (`@agenteschat/ui/widgets/spec`: `WidgetSpec`, `validateWidgetSpec`, `chartBlockToWidgetSpec`, schedules, sizes, caps); engine `packages/engine/src/dashboards/*` (who sees and edits `access.ts`, boards and widgets `service.ts`, Pin `pin.ts`, cost `cost.ts`, suggestions `suggestions.ts`, an agent's request to publish `proposals.ts`, agent tools `tools.ts`, ids-only events `events.ts`); a widget is redone by its own routine (target `widget`, ADR 0053): `refresh.ts` (`syncWidgetRoutine`, "Update now"/"Resolve" `refreshWidgetNow`, "Ask for a change", `update_widget`), `refresh-context.ts` (the run's brief), `refresh-fire.ts` (read by `routines.ts` as it fires), `refresh-ledger.ts` (endings, failures, history, alerts); notices `widget_alert`, `widget_failed`, `dashboard_proposal` in `notification-producers.ts`; routes `apps/server/src/routes/app/dashboards.ts` + `dashboard-schemas.ts`; client `packages/client/src/dashboards/*` (`openTarget`/`homeTarget` in `lib/notifications.ts`); drawing `packages/ui/src/widgets/*` (`WidgetCard`, `WidgetBody`, `ChartPieces.tsx`: the line and dither painter the chat's `ChartBlock` shares); web `pages/DashboardsPage.tsx`, `DashboardPage.tsx`, `components/dashboards/*`, `components/widgets/*` (`HomeMural` on Home, `WidgetPanel`, `PinToDashboard`); phone: a row on the home (Chats) `src/features/chats/DashboardsEntry.tsx` pushes `app/(app)/dashboards.tsx` (the tab bar has no Dashboards tab), pushed screens `board/[id]`, `widget/[id]`, `widget-new`, `widget-pin`, `board-*`, screens in `src/features/dashboards/*`.
+diff --git a/apps/server/runner/browser.ts b/apps/server/runner/browser.ts
+index 1299abe23..731ac6bd2 100644
+--- a/apps/server/runner/browser.ts
++++ b/apps/server/runner/browser.ts
+@@ -233,6 +233,16 @@ const INPUT_TIMEOUT_MS = 5_000;
+  * would still run it afterwards, while the person had been told it never reached the page.
+  */
+ const DAEMON_HOLD_MS = 30_000;
++/**
++ * A person's input goes to the page straight from the runner, on its own DevTools socket to the tab (`PageLink`): the
++ * daemon's one lock, which its relay waits on too, is also held by its own upkeep (each cross-origin frame that
++ * attaches, a page that loads: measured 0.4 to 1.4 s per load of a Cloudflare check on a desktop, against 0 to 2 ms
++ * on the tab's own socket) and by any command of its own that waits on Chrome (up to 30 s). That socket opens within
++ * this, or the input goes on the relay as before.
++ */
++const PAGE_OPEN_MS = 1000;
++/** A tab whose socket didn't open is tried again after this; the relay carries the input meanwhile. */
++const PAGE_RETRY_MS = 10_000;
+ /** After a failed download or install, wait this long before trying again. */
+ const RETRY_FAILURE_MS = 10 * 60_000;
+ const STREAM_OPEN_MS = 5000;
+@@ -1352,6 +1362,166 @@ function releaseHeld(state: InputState, mask = ~0): Record<string, unknown>[] {
+     .flatMap((button) => relayCommands({ kind: "mouse", type: "mouseReleased", x: at.x, y: at.y, button }, state));
+ }
+ 
++/** One DevTools call on a tab's own socket (`PageLink`). */
++export interface PageCall {
++  method: string;
++  params: Record<string, unknown>;
++}
++
++/** Virtual key codes of the keys `press` names (`agent-browser`'s `named_key_info`, 0.39.1). */
++const NAMED_KEYS: Record<string, [key: string, code: string, keyCode: number]> = {
++  enter: ["Enter", "Enter", 13],
++  return: ["Enter", "Enter", 13],
++  tab: ["Tab", "Tab", 9],
++  escape: ["Escape", "Escape", 27],
++  esc: ["Escape", "Escape", 27],
++  backspace: ["Backspace", "Backspace", 8],
++  delete: ["Delete", "Delete", 46],
++  arrowup: ["ArrowUp", "ArrowUp", 38],
++  arrowdown: ["ArrowDown", "ArrowDown", 40],
++  arrowleft: ["ArrowLeft", "ArrowLeft", 37],
++  arrowright: ["ArrowRight", "ArrowRight", 39],
++  home: ["Home", "Home", 36],
++  end: ["End", "End", 35],
++  pageup: ["PageUp", "PageUp", 33],
++  pagedown: ["PageDown", "PageDown", 34],
++  space: [" ", "Space", 32],
++  " ": [" ", "Space", 32],
++};
++/** A US layout's punctuation keys: their `code` and virtual key code (as `agent-browser` and Playwright have them). */
++const PUNCTUATION: [chars: string, code: string, keyCode: number][] = [
++  [";:", "Semicolon", 186],
++  ["=+", "Equal", 187],
++  [",<", "Comma", 188],
++  ["-_", "Minus", 189],
++  [".>", "Period", 190],
++  ["/?", "Slash", 191],
++  ["`~", "Backquote", 192],
++  ["[{", "BracketLeft", 219],
++  ["\\|", "Backslash", 220],
++  ["]}", "BracketRight", 221],
++  ["'\"", "Quote", 222],
++];
++/** The modifier keys' own codes, for a modifier held down or let go on its own. */
++const MODIFIER_CODES: Record<string, number> = { Shift: 16, Control: 17, Alt: 18, Meta: 91 };
++/** The text a named key types (one character types itself). */
++const KEY_TEXT: Record<string, string> = { Enter: "\r", Tab: "\t" };
++const CHORD_BITS: Record<string, number> = { alt: 1, control: 2, ctrl: 2, meta: 4, cmd: 4, command: 4, shift: 8 };
++
++/** A key `press` names, as DevTools takes it: key, code, virtual key code. */
++function keyInfo(name: string): [key: string, code: string, keyCode: number] {
++  const named = NAMED_KEYS[name.toLowerCase()];
++  if (named) return named;
++  const chars = [...name];
++  if (chars.length !== 1) return [name, name, 0];
++  const ch = name;
++  if (/^[a-z]$/i.test(ch)) return [ch, `Key${ch.toUpperCase()}`, ch.toUpperCase().charCodeAt(0)];
++  if (/^[0-9]$/.test(ch)) return [ch, `Digit${ch}`, ch.charCodeAt(0)];
++  const p = PUNCTUATION.find(([set]) => set.includes(ch));
++  return [ch, p?.[1] ?? "", p?.[2] ?? 0];
++}
++
++/**
++ * The DevTools calls that do on the page what one relay command (`relayCommands`) asks `agent-browser` to do, the
++ * way its 0.39.1 does it (`input_mouse`, `input_keyboard`, `keyboard insertText`, `press` with a chord, `evaluate`),
++ * or null for anything else (it goes on the relay).
++ */
++export function pageCalls(command: Record<string, unknown>): PageCall[] | null {
++  const num = (v: unknown, d = 0) => (typeof v === "number" && Number.isFinite(v) ? v : d);
++  switch (command.action) {
++    case "input_mouse":
++      return [
++        {
++          method: "Input.dispatchMouseEvent",
++          params: {
++            type: command.type,
++            x: num(command.x),
++            y: num(command.y),
++            button: command.button,
++            buttons: num(command.buttons),
++            clickCount: num(command.clickCount),
++            deltaX: num(command.deltaX),
++            deltaY: num(command.deltaY),
++            modifiers: num(command.modifiers),
++          },
++        },
++      ];
++    case "keyboard":
++      if (command.subaction !== "insertText" || typeof command.text !== "string") return null;
++      return [{ method: "Input.insertText", params: { text: command.text } }];
++    case "input_keyboard": {
++      if (typeof command.key !== "string") return null;
++      const keyCode = MODIFIER_CODES[command.key];
++      return [
++        {
++          method: "Input.dispatchKeyEvent",
++          params: {
++            type: command.type,
++            key: command.key,
++            ...(typeof command.code === "string" ? { code: command.code } : {}),
++            ...(keyCode ? { windowsVirtualKeyCode: keyCode, nativeVirtualKeyCode: keyCode } : {}),
++          },
++        },
++      ];
++    }
++    case "press": {
++      if (typeof command.key !== "string" || !command.key) return null;
++      // "Control+a", "Shift+Enter": the modifiers, then what is left is the key ("+" alone is a key).
++      const parts = command.key.split("+");
++      let modifiers = 0;
++      const rest: string[] = [];
++      for (const part of parts) {
++        const bit = parts.length > 1 ? CHORD_BITS[part.toLowerCase()] : undefined;
++        if (bit) modifiers |= bit;
++        else rest.push(part);
++      }
++      const name = modifiers === 0 || rest.length === 0 ? command.key : rest.join("+");
++      const [key, code, keyCode] = keyInfo(name);
++      // Control or Meta make it a command (select all, copy), not text.
++      const typed = KEY_TEXT[key] ?? ([...key].length === 1 ? key : undefined);
++      const text = modifiers & 6 ? undefined : typed;
++      const base = {
++        key,
++        code,
++        windowsVirtualKeyCode: keyCode,
++        nativeVirtualKeyCode: keyCode,
++        ...(modifiers ? { modifiers } : {}),
++      };
++      return [
++        {
++          method: "Input.dispatchKeyEvent",
++          params: { type: "keyDown", ...base, ...(text ? { text, unmodifiedText: text } : {}) },
++        },
++        { method: "Input.dispatchKeyEvent", params: { type: "keyUp", ...base } },
++      ];
++    }
++    case "evaluate":
++      if (typeof command.script !== "string") return null;
++      return [{ method: "Runtime.evaluate", params: { expression: command.script, returnByValue: true } }];
++    default:
++      return null;
++  }
++}
++
++/**
++ * A tab's own DevTools socket while a person drives it (`ws://127.0.0.1:<port>/devtools/page/<target>`): their input
++ * goes there, beside `agent-browser`'s connection, never through its daemon (`PAGE_OPEN_MS`).
++ */
++interface PageLink {
++  targetId: string;
++  socket: StreamSocket;
++  /** True once open; false when it couldn't open or closed. */
++  ready: Promise<boolean>;
++  open: boolean;
++  /** When it failed to open (or closed): tried again only after `PAGE_RETRY_MS`. */
++  failedAt?: number;
++  nextId: number;
++  waiting: Map<number, (answer: Record<string, unknown> | null) => void>;
++}
++
++/** A DevTools target id as Chrome makes them: anything else never goes into a socket's address. */
++const TARGET_ID = /^[A-Za-z0-9_-]{1,128}$/;
++
+ /** The subset of a WebSocket the stream relay uses (a fake in tests). */
+ export interface StreamSocket {
+   send(data: string): void;
+@@ -1404,6 +1574,8 @@ export interface BrowserManagerOptions {
+   now?: () => number;
+   /** Tests: opens the session's stream socket. */
+   connectStream?: (url: string) => StreamSocket;
++  /** Tests: opens a tab's own DevTools socket, where a person's input goes (`PageLink`). */
++  connectPage?: (url: string) => StreamSocket;
+   /** Tests: opens a Chrome's browser endpoint (its traffic and its pages that die). */
+   connectDevtools?: (url: string) => StreamSocket;
+   /**
+@@ -1449,6 +1621,10 @@ interface Stream {
+   url?: string;
+   /** The active tab's title, from the stream's tab list (cleared when the URL moves on). */
+   title?: string;
++  /** The active tab's DevTools target, from the stream's tab list: a person's input goes there (`page`). */
++  targetId?: string;
++  /** That tab's own DevTools socket, opened at the person's first input (`pageLink`). */
++  page?: PageLink;
+   /** The page's size in CSS pixels, from the stream's status. */
+   viewport?: { width: number; height: number };
+   /** A frame went out on this stream. */
+@@ -3851,7 +4027,7 @@ export class BrowserManager {
+     while (session.streamOpening) await session.streamOpening.catch(() => undefined);
+     if (session.stream) {
+       if (session.stream.mode !== mode) {
+-        if (mode === "watch") this.letGo(session.stream);
++        if (mode === "watch") this.letGo(session, session.stream);
+         session.stream.mode = mode;
+         // Pacing again too: a config that leaves it out may put the stream back on its default.
+         session.stream.socket.send(JSON.stringify({ type: "config", pacing: "ack", maxFps: STREAM_FPS[mode] }));
+@@ -3946,6 +4122,7 @@ export class BrowserManager {
+     if (old) {
+       old.closing = true;
+       this.settleSource(old);
++      this.closePage(old);
+       try {
+         old.socket.close();
+       } catch {
+@@ -3959,6 +4136,7 @@ export class BrowserManager {
+     socket.onerror = () => undefined;
+     socket.onclose = () => {
+       this.settleSource(stream);
++      this.closePageAfterInput(stream);
+       if (session.stream !== stream) return;
+       session.stream = undefined;
+       this.changed();
+@@ -4018,6 +4196,9 @@ export class BrowserManager {
+     // Sent on connect and after every command: the active tab's address and title.
+     if (msg.type === "tabs" && Array.isArray(msg.tabs)) {
+       const active = msg.tabs.find((t) => isRecord(t) && t.active === true);
++      if (isRecord(active) && typeof active.targetId === "string" && TARGET_ID.test(active.targetId)) {
++        stream.targetId = active.targetId;
++      }
+       if (isRecord(active) && typeof active.url === "string") {
+         setUrl(active.url);
+         if (typeof active.title === "string" && active.title) {
+@@ -4127,6 +4308,36 @@ export class BrowserManager {
+     });
+     const waiting = () => session.stream === stream && !stream.framed && !this.closed && !!stream.viewport;
+     if (!waiting()) return;
++    const sendShot = (data: string) => {
++      const size = stream.viewport;
++      if (!data || data.length > BROWSER_LIMITS.frameBytes || !size || !waiting()) return;
++      stream.framed = true;
++      this.opts.send({
++        type: "browser.frame",
++        agentId: session.agentId,
++        seq: 0,
++        data,
++        metadata: {
++          deviceWidth: size.width,
++          deviceHeight: size.height,
++          capturedAt: this.now(),
++          ...pageMeta(session, stream),
++        },
++      });
++    };
++    // A person drives it: the picture comes from the tab's own socket (`PageLink`), never held in the daemon's queue
++    // in front of their input, nor holding that queue while they type.
++    const link = this.driving(session) ? await this.pageLink(session, stream) : null;
++    if (link) {
++      const shot = await this.pageCall(
++        link,
++        { method: "Page.captureScreenshot", params: { format: "jpeg", quality: 70 } },
++        QUICK_TIMEOUT_MS,
++      );
++      const data = shot && isRecord(shot.result) && typeof shot.result.data === "string" ? shot.result.data : "";
++      if (data) return sendShot(data);
++      if (!waiting()) return;
++    }
+     const file = path.join(this.opts.home, "browser", `${session.name}-frame.jpg`);
+     await this.enqueue(session, async () => {
+       if (!waiting()) return;
+@@ -4136,22 +4347,7 @@ export class BrowserManager {
+           ["screenshot", file, "--screenshot-format", "jpeg", "--screenshot-quality", "70"],
+           { timeoutMs: QUICK_TIMEOUT_MS },
+         );
+-        const data = shot.success ? (await readFile(file)).toString("base64") : "";
+-        const size = stream.viewport;
+-        if (!data || data.length > BROWSER_LIMITS.frameBytes || !size || !waiting()) return;
+-        stream.framed = true;
+-        this.opts.send({
+-          type: "browser.frame",
+-          agentId: session.agentId,
+-          seq: 0,
+-          data,
+-          metadata: {
+-            deviceWidth: size.width,
+-            deviceHeight: size.height,
+-            capturedAt: this.now(),
+-            ...pageMeta(session, stream),
+-          },
+-        });
++        sendShot(shot.success ? (await readFile(file)).toString("base64") : "");
+       } finally {
+         await rm(file, { force: true }).catch(() => undefined);
+       }
+@@ -4163,7 +4359,7 @@ export class BrowserManager {
+     const session = this.sessions.get(String(agent.id ?? ""));
+     while (session?.streamOpening) await session.streamOpening.catch(() => undefined);
+     if (!session?.stream) return { stopped: false };
+-    this.letGo(session.stream);
++    this.letGo(session, session.stream);
+     this.endStream(session, "stopped");
+     return { stopped: true };
+   }
+@@ -4174,6 +4370,7 @@ export class BrowserManager {
+       if (!s.stream) continue;
+       s.stream.closing = true;
+       this.settleSource(s.stream);
++      this.closePageAfterInput(s.stream);
+       s.stream.socket.close();
+       s.stream = undefined;
+     }
+@@ -4185,6 +4382,7 @@ export class BrowserManager {
+     if (!stream) return;
+     stream.closing = true;
+     this.settleSource(stream);
++    this.closePageAfterInput(stream);
+     session.stream = undefined;
+     try {
+       stream.socket.close();
+@@ -4196,9 +4394,9 @@ export class BrowserManager {
+   }
+ 
+   /**
+-   * `browser.input`: a person's input during a take over, in order, through
+-   * the daemon's command relay (the active tab, each one confirmed before the
+-   * next), a drag with the gaps the person made (`dragDelay`), never more
++   * `browser.input`: a person's input during a take over, in order, on the
++   * active tab's own DevTools socket (`toPage`; the daemon's command relay
++   * when that can't open), each one confirmed before the next, a drag with the gaps the person made (`dragDelay`), never more
+    * than `DRAG_LAG_MAX_MS` behind. The stream socket only carries frames. Text with nothing on the page to take it
+    * is said (`nowhere`), and the picture taken again: an idle page may be showing what was there before.
+    */
+@@ -4229,11 +4427,11 @@ export class BrowserManager {
+         }
+         let ok = true;
+         for (const command of relayCommands(e, stream.input)) {
+-          if (!(await this.relay(stream.port, command, session))) ok = false;
++          if (!(await this.toPage(session, stream, command))) ok = false;
+         }
+         if (e.kind === "text" && !asked) {
+           asked = true;
+-          const seen = await this.relayAnswer(stream.port, { action: "evaluate", script: TAKES_TEXT }, session);
++          const seen = await this.toPage(session, stream, { action: "evaluate", script: TAKES_TEXT });
+           nowhere = isRecord(seen?.data) && seen.data.result === false;
+         }
+         if (stream.input.pointer) session.pointer = stream.input.pointer;
+@@ -4254,15 +4452,159 @@ export class BrowserManager {
+    * The person's control ended (back to watching, or nobody watches): a button they still hold lets go where their
+    * pointer was, after the input queued before, so the agent doesn't go on with it held.
+    */
+-  private letGo(stream: Stream) {
++  private letGo(session: Session, stream: Stream) {
+     stream.inputQueue = stream.inputQueue.then(async () => {
+-      for (const command of releaseHeld(stream.input)) await this.relay(stream.port, command);
++      for (const command of releaseHeld(stream.input)) await this.toPage(session, stream, command);
++    });
++  }
++
++  /**
++   * One of the person's commands on the page, and its answer (null: it didn't run). On the tab's own DevTools socket
++   * when it opens (`PageLink`), so nothing that holds `agent-browser`'s daemon holds it; on the daemon's relay
++   * otherwise. A command the socket took and that failed or timed out there isn't sent again on the relay: it may have
++   * reached the page.
++   */
++  private async toPage(
++    session: Session,
++    stream: Stream,
++    command: Record<string, unknown>,
++  ): Promise<Record<string, unknown> | null> {
++    const calls = pageCalls(command);
++    const link = calls ? await this.pageLink(session, stream) : null;
++    if (!calls || !link) return this.relayAnswer(stream.port, command, session);
++    let last: Record<string, unknown> = {};
++    for (const call of calls) {
++      const answer = await this.pageCall(link, call, this.opts.inputTimeoutMs ?? INPUT_TIMEOUT_MS);
++      if (!answer || answer.error !== undefined) return null;
++      last = isRecord(answer.result) ? answer.result : {};
++    }
++    if (command.action !== "evaluate") return { success: true };
++    // As the relay answers an `evaluate`: its value under `data.result`.
++    if (last.exceptionDetails !== undefined) return null;
++    return { success: true, data: { result: isRecord(last.result) ? last.result.value : undefined } };
++  }
++
++  /**
++   * The active tab's own DevTools socket (`PageLink`), opened (or opened again for another tab) as needed; null while
++   * there is none to open (no target known yet, no Chrome of ours) or one failed less than `PAGE_RETRY_MS` ago.
++   */
++  private async pageLink(session: Session, stream: Stream): Promise<PageLink | null> {
++    const targetId = stream.targetId;
++    const port = session.chrome?.port;
++    if (!targetId || !port || stream.closing || session.stream !== stream) return null;
++    let link = stream.page;
++    if (link && link.targetId !== targetId) link = this.closePage(stream);
++    if (link && link.failedAt !== undefined) {
++      if (this.now() - link.failedAt < PAGE_RETRY_MS) return null;
++      link = this.closePage(stream);
++    }
++    link ??= this.openPage(stream, port, targetId);
++    return (await link.ready) ? link : null;
++  }
++
++  private openPage(stream: Stream, port: number, targetId: string): PageLink {
++    const link: PageLink = {
++      targetId,
++      socket: null as unknown as StreamSocket,
++      ready: Promise.resolve(false),
++      open: false,
++      nextId: 1,
++      waiting: new Map(),
++    };
++    stream.page = link;
++    link.ready = new Promise<boolean>((resolve) => {
++      let timer: ReturnType<typeof setTimeout> | undefined;
++      const fail = () => {
++        clearTimeout(timer);
++        link.open = false;
++        link.failedAt ??= this.now();
++        for (const done of [...link.waiting.values()]) done(null);
++        link.waiting.clear();
++        resolve(false);
++      };
++      try {
++        const url = `ws://127.0.0.1:${port}/devtools/page/${targetId}`;
++        link.socket = (this.opts.connectPage ?? ((u: string) => new WebSocket(u) as unknown as StreamSocket))(url);
++      } catch {
++        fail();
++        return;
++      }
++      const socket = link.socket;
++      timer = setTimeout(() => {
++        fail();
++        try {
++          socket.close();
++        } catch {
++          // already closed
++        }
++      }, PAGE_OPEN_MS);
++      (timer as { unref?: () => void }).unref?.();
++      socket.onopen = () => {
++        clearTimeout(timer);
++        if (link.failedAt !== undefined) return;
++        link.open = true;
++        resolve(true);
++      };
++      socket.onerror = fail;
++      socket.onclose = fail;
++      socket.onmessage = (event) => {
++        let msg: unknown;
++        try {
++          const raw = event.data;
++          msg = JSON.parse(typeof raw === "string" ? raw : Buffer.from(raw as ArrayBuffer).toString("utf8"));
++        } catch {
++          return;
++        }
++        // Answers carry the id they were asked under; events (none asked for) carry none.
++        if (isRecord(msg) && typeof msg.id === "number") link.waiting.get(msg.id)?.(msg);
++      };
++    });
++    return link;
++  }
++
++  /** One DevTools call on the tab's socket: Chrome's answer (`result` or `error`), null if none came in `timeoutMs`. */
++  private pageCall(link: PageLink, call: PageCall, timeoutMs: number): Promise<Record<string, unknown> | null> {
++    if (!link.open) return Promise.resolve(null);
++    const id = link.nextId++;
++    return new Promise((resolve) => {
++      const done = (answer: Record<string, unknown> | null) => {
++        clearTimeout(timer);
++        link.waiting.delete(id);
++        resolve(answer);
++      };
++      const timer = setTimeout(() => done(null), timeoutMs);
++      (timer as { unref?: () => void }).unref?.();
++      link.waiting.set(id, done);
++      try {
++        link.socket.send(JSON.stringify({ id, method: call.method, params: call.params }));
++      } catch {
++        done(null);
++      }
+     });
+   }
+ 
+-  /** One command on the daemon's relay; true when it ran. */
+-  private async relay(port: number, command: Record<string, unknown>, session?: Session): Promise<boolean> {
+-    return (await this.relayAnswer(port, command, session)) !== null;
++  /** The tab's socket closes (the stream ended, or another tab is active): undefined, for `pageLink`. */
++  private closePage(stream: Stream): undefined {
++    const link = stream.page;
++    if (!link) return undefined;
++    stream.page = undefined;
++    link.failedAt ??= this.now();
++    link.open = false;
++    for (const done of [...link.waiting.values()]) done(null);
++    link.waiting.clear();
++    try {
++      link.socket.onclose = null;
++      link.socket.onerror = null;
++      link.socket.close();
++    } catch {
++      // already closed
++    }
++    return undefined;
++  }
++
++  /** Once the input queued on a stream that ended has run, its tab's socket closes. */
++  private closePageAfterInput(stream: Stream) {
++    void stream.inputQueue.then(() => this.closePage(stream));
+   }
+ 
+   /**
+diff --git a/apps/server/test/runner/browser.test.ts b/apps/server/test/runner/browser.test.ts
+index 26e9e7ddd..433cfdcdc 100644
+--- a/apps/server/test/runner/browser.test.ts
++++ b/apps/server/test/runner/browser.test.ts
+@@ -942,8 +942,164 @@ describe("a person takes control while the agent's pointer and keys are going",
+       relay.server.stop(true);
+     }
+   });
++
++  test("with the daemon held (its own upkeep, a picture, a call hung on Chrome), the person's input still reaches the page at once", async () => {
++    // The daemon's one lock, which its relay waits on too, held for good: in production each input waited there 5 s
++    // and failed ("this didn't reach the page") on a Cloudflare check.
++    let relayed = 0;
++    const daemon = Bun.serve({
++      port: 0,
++      hostname: "127.0.0.1",
++      async fetch() {
++        relayed++;
++        await new Promise(() => {});
++        return new Response(null);
++      },
++    });
++    const pages: FakePage[] = [];
++    const t = setup({
++      inputTimeoutMs: 2_000,
++      firstFrameMs: 30,
++      connectPage: (url) => {
++        const p = new FakePage(url);
++        pages.push(p);
++        queueMicrotask(() => p.onopen?.());
++        return p;
++      },
++      ...(posix ? {} : { startPageDirectory: tempDir() }),
++    });
++    try {
++      await t.act("open", ["https://dash.example.com/login"]);
++      t.page({ port: daemon.port, viewport: [1280, 800] });
++      await t.manager.streamStart(dev, "control");
++      const stream = t.sockets.at(-1) as FakeSocket;
++      stream.push({ type: "status", viewportWidth: 1280, viewportHeight: 800 });
++      stream.push({
++        type: "tabs",
++        tabs: [
++          { targetId: "START0", url: "file:///start.html", active: false },
++          { targetId: "AB12CD34", url: "https://dash.example.com/login", active: true },
++        ],
++      });
++      // An idle page sends no frame: its first picture comes from the tab's socket too, not the held daemon.
++      await waitFor(() => t.frames.some((f) => f.type === "browser.frame" && f.seq === 0));
++      const startedAt = performance.now();
++      const res = await t.manager.input(dev, [
++        { kind: "mouse", type: "mouseMoved", x: 40, y: 50 },
++        { kind: "mouse", type: "mousePressed", x: 40, y: 50, button: "left", clickCount: 1 },
++        { kind: "mouse", type: "mouseReleased", x: 40, y: 50, button: "left", clickCount: 1 },
++        { kind: "text", text: "maria@example.com" },
++        { kind: "key", type: "keyDown", key: "Enter" },
++        { kind: "key", type: "keyDown", key: "a", modifiers: 2 },
++      ]);
++      const took = performance.now() - startedAt;
++      expect(res).toEqual({ accepted: 6 });
++      expect(took).toBeLessThan(300);
++      expect(relayed).toBe(0);
++      expect(pages.map((p) => p.url)).toEqual([`ws://127.0.0.1:${t.chromes[0]?.port}/devtools/page/AB12CD34`]);
++      const calls = (pages[0] as FakePage).calls.filter((c) => c.method !== "Page.captureScreenshot");
++      expect(calls).toEqual([
++        {
++          method: "Input.dispatchMouseEvent",
++          params: expect.objectContaining({ type: "mouseMoved", x: 40, y: 50, button: "none", buttons: 0 }),
++        },
++        {
++          method: "Input.dispatchMouseEvent",
++          params: expect.objectContaining({ type: "mousePressed", button: "left", buttons: 1, clickCount: 1 }),
++        },
++        {
++          method: "Input.dispatchMouseEvent",
++          params: expect.objectContaining({ type: "mouseReleased", button: "left", buttons: 0, clickCount: 1 }),
++        },
++        { method: "Input.insertText", params: { text: "maria@example.com" } },
++        // Whether a field took the text: asked on the tab, too.
++        { method: "Runtime.evaluate", params: expect.objectContaining({ returnByValue: true }) },
++        {
++          method: "Input.dispatchKeyEvent",
++          params: expect.objectContaining({ type: "keyDown", key: "Enter", windowsVirtualKeyCode: 13, text: "\r" }),
++        },
++        { method: "Input.dispatchKeyEvent", params: expect.objectContaining({ type: "keyUp", key: "Enter" }) },
++        {
++          method: "Input.dispatchKeyEvent",
++          params: {
++            type: "keyDown",
++            key: "a",
++            code: "KeyA",
++            windowsVirtualKeyCode: 65,
++            nativeVirtualKeyCode: 65,
++            modifiers: 2,
++          },
++        },
++        {
++          method: "Input.dispatchKeyEvent",
++          params: {
++            type: "keyUp",
++            key: "a",
++            code: "KeyA",
++            windowsVirtualKeyCode: 65,
++            nativeVirtualKeyCode: 65,
++            modifiers: 2,
++          },
++        },
++      ]);
++      // Another tab becomes the active one (a popup the click opened): the input follows it there.
++      stream.push({ type: "tabs", tabs: [{ targetId: "EF56", url: "https://appleid.example.com/", active: true }] });
++      expect(await t.manager.input(dev, [{ kind: "mouse", type: "mouseMoved", x: 1, y: 2 }])).toEqual({ accepted: 1 });
++      expect(pages.map((p) => p.url.split("/").at(-1))).toEqual(["AB12CD34", "EF56"]);
++      expect((pages[0] as FakePage).closed).toBe(true);
++      // The stream ends: so does the tab's socket.
++      await t.manager.streamStop(dev);
++      await waitFor(() => (pages[1] as FakePage).closed);
++    } finally {
++      daemon.stop(true);
++    }
++  });
++
++  test.if(posix)("a tab whose socket can't open: the input goes on the daemon's relay as before", async () => {
++    const relay = fakeRelay();
++    const t = setup({
++      connectPage: (url) => {
++        const p = new FakePage(url);
++        queueMicrotask(() => p.onerror?.());
++        return p;
++      },
++    });
++    try {
++      await t.act("open", ["https://shop.example.com"]);
++      t.page({ port: relay.port });
++      await t.manager.streamStart(dev, "control");
++      (t.sockets.at(-1) as FakeSocket).push({
++        type: "tabs",
++        tabs: [{ targetId: "AB12CD34", url: "https://shop.example.com/", active: true }],
++      });
++      const res = await t.manager.input(dev, [
++        { kind: "mouse", type: "mousePressed", x: 5, y: 6, button: "left", clickCount: 1 },
++        { kind: "mouse", type: "mouseReleased", x: 5, y: 6, button: "left", clickCount: 1 },
++      ]);
++      expect(res).toEqual({ accepted: 2 });
++      expect(relay.received.map((r) => r.body.type)).toEqual(["mousePressed", "mouseReleased"]);
++    } finally {
++      relay.server.stop(true);
++    }
++  });
+ });
+ 
++/** A tab's own DevTools socket (`connectPage`): records each call and answers it as Chrome does. */
++class FakePage extends FakeSocket {
++  calls: { method: string; params: Record<string, unknown> }[] = [];
++  override send(data: string) {
++    const msg = JSON.parse(data) as { id: number; method: string; params: Record<string, unknown> };
++    this.calls.push({ method: msg.method, params: msg.params });
++    const result =
++      msg.method === "Runtime.evaluate"
++        ? { result: { type: "boolean", value: true } }
++        : msg.method === "Page.captureScreenshot"
++          ? { data: Buffer.from("jpeg").toString("base64") }
++          : {};
++    queueMicrotask(() => this.push({ id: msg.id, result }));
++  }
++}
++
+ test("after a hover the pointer goes straight to the next element, and curves again once it left", async () => {
+   const t = setup();
+   await t.act("open", ["https://shop.example.com"]);
+diff --git a/docs/adr/0040-agent-browser.md b/docs/adr/0040-agent-browser.md
+index 9fe57105a..68534b818 100644
+--- a/docs/adr/0040-agent-browser.md
++++ b/docs/adr/0040-agent-browser.md
+@@ -226,6 +226,14 @@ A beta customer, the only owner of his agents, could not paste into a sign-in pa
+ 
+ Where the agent's Chrome runs on its desktop (ADR 0058 §7), the browser's open handoff also holds the screen. Someone who may drive the computer (`computerDriving`) and holds that handoff (a request they took, or a take over of the browser) now drives the whole screen: the desktop's control stream is allowed for them (`streamAccess`), their watching stream switches to control in place when they take it and back when they hand it back (`createDesktopControl`), and leaving keeps control for the grace as on the screen's own handoff. The apps open the computer dialog on the screen for them (`drivesOnDesktop`), with the request's banner on top and Pronto / Não consegui as before; the chat card's Abrir aqui opens that dialog instead of the page. Everyone else (who may drive only the browser) gets the page as before, and so does a computer without screens. Someone other than the owner who gets the screen this way is audited and the owner told, as for a take over of the screen (`desktop.control_taken`, ADR 0059 §8). The agent hears the same browser hand back (`done`, `failed`), and reads the page again.
+ 
++### 17. A person's input on the tab's own socket (2026-11-13)
++
++A person in control saw "this didn't reach the page" on a Cloudflare check: each input waited the relay's 5 s and failed, with nothing of the agent running (its commands are refused while a person drives). The relay (`POST /api/command` on the stream port) runs inside `agent-browser`'s daemon, behind the one lock its commands take, and the daemon holds that lock for its own upkeep too: every 100 ms it applies what Chrome reported, and each cross-origin frame that attaches (a challenge's iframe) is set up there one DevTools call after another, any of which may wait up to its 30 s timeout (checked in 0.39.1's source, `daemon.rs` and `apply_drained_events`). Measured on a desktop with the same build: each load of a Cloudflare check held the relay 0.4 to 1.4 s, while `Input.dispatchMouseEvent` on the tab's own DevTools socket answered in 0 to 2 ms; with the daemon held by a command of its own, input on the relay failed at 5 s and on the tab's socket took 36 ms at most.
++
++- While a person drives, the runner opens the active tab's own DevTools socket (`ws://127.0.0.1:<port>/devtools/page/<target>`, the target from the stream's tab list, which follows a new active tab) and sends their input there as the same DevTools calls `agent-browser` makes for its relay commands (`pageCalls`: mouse, `insertText`, modifier keys, `press` chords with their key codes, the check that a field took the text). The live view's first picture while they drive comes from there too (`Page.captureScreenshot`), out of the daemon's queue.
++- The relay stays the fallback: no target known, or a socket that doesn't open within 1 s (tried again after 10 s). A call the tab's socket took isn't sent again on the relay.
++- The socket closes with the stream, once the input queued on it has run. Nothing else changes: the agent's commands, frames and pacing stay on `agent-browser`.
++
+ ## Order
+ 
+ First version: stages 0–7. Difficulty: **easy** (known pattern, little risk), **medium** (new pieces on known patterns).
+-- 
+2.43.0
+

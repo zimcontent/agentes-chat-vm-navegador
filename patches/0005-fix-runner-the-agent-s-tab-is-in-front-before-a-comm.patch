@@ -1,0 +1,277 @@
+From 4c1393f8bcc1de2442037f5346dc73d2a7be041c Mon Sep 17 00:00:00 2001
+From: Gabriel Zim <235131889+zimcontent@users.noreply.github.com>
+Date: Sat, 14 Nov 2026 01:08:34 +0000
+Subject: [PATCH 5/6] fix(runner): the agent's tab is in front before a command
+
+On one computer over a day, 17% of the agents' clicks and 41% of their
+fills answered "The browser didn't answer within 33 s". Chrome starts
+with the tabs it had (--restore-last-session) and agent-browser may hold
+one that is in the background. A hidden page answers no pointer event, so
+each mouse move of the press waited 5 s and the batch ended at its limit,
+in headless Chrome and on the agents' desktops alike.
+
+Before a command that needs the page, the runner asks the tab whether it
+shows (document.visibilityState, at most once a second) and brings a
+hidden one to the front with agent-browser's own tab switch. A live view
+that opens does the same. It never fails a command, and a tab that stays
+hidden is left for 30 s.
+
+Measured on Chrome 156: a click, a list, a download link and a file
+button went from 33 s (failed) to 0.7-0.9 s; a 30-character fill from
+33 s (failed) to 3.3 s. ADR 0040 section 19.
+
+Co-Authored-By: Claude Fable 5.2 <noreply@anthropic.com>
+---
+ apps/server/runner/browser.ts                 | 53 +++++++++++++++++
+ apps/server/test/runner/browser.test.ts       | 57 ++++++++++++++++++-
+ .../server/test/runner/fake-agent-browser.mjs | 17 +++++-
+ docs/adr/0040-agent-browser.md                | 11 ++++
+ 4 files changed, 133 insertions(+), 5 deletions(-)
+
+diff --git a/apps/server/runner/browser.ts b/apps/server/runner/browser.ts
+index 2f1ca1d4f..b2320aca7 100644
+--- a/apps/server/runner/browser.ts
++++ b/apps/server/runner/browser.ts
+@@ -1072,6 +1072,12 @@ const BATCH_STEP_MS = 8;
+  * own `click` watches for the dialog, `mouse up` doesn't): the batch outlasts that, to hear why.
+  */
+ const HELD_PRESS_MS = 33_000;
++/** How long a tab found showing is taken to still be: the commands of one batch share one look. */
++const SHOWN_MS = 1_000;
++/** How long before a tab that couldn't be told, or brought to the front, is looked at again. */
++const SHOWN_RETRY_MS = 30_000;
++/** Commands that need no page showing: they change which tab it is, or only wait. */
++const NO_PAGE = new Set(["tab", "wait", "dialog", "agentes:viewport"]);
+ const VIEWPORT = "[window.innerWidth, window.innerHeight]";
+ 
+ /** A page's size in its own pixels, or null when what was read isn't one. */
+@@ -1710,6 +1716,10 @@ interface Session {
+   link?: string;
+   /** Where the agent's pointer was left on the page (`humanly`). */
+   pointer?: Point;
++  /** Until when the agent's tab needs no look at whether it shows (`foreground`). */
++  shownUntil?: number;
++  /** Its tab was brought to the front and hasn't been seen showing since. */
++  broughtUp?: boolean;
+   /** Where its `hover` left it. While that is still `pointer` (the same object), a menu it opened is taken to be open. */
+   hovered?: Point;
+   /**
+@@ -2496,6 +2506,7 @@ export class BrowserManager {
+       return answer;
+     }
+     if (!READS.has(command)) await this.ensureOwnChrome(agent, session, desktop, allowed, false, setup);
++    if (!NO_PAGE.has(command)) await this.foreground(session, stops);
+     if (command === "agentes:viewport") {
+       const answer = this.setViewport(session, browserViewportOf(args) ?? null);
+       this.noteAct(session, command, args, answer, link);
+@@ -2554,6 +2565,44 @@ export class BrowserManager {
+     return answer;
+   }
+ 
++  /**
++   * The tab `agent-browser` works in, brought to the front when it doesn't show. Chrome starts with the tabs it had
++   * (the agent's sign-ins on session cookies come back with them) in front of which it puts the page it was started
++   * on, and `agent-browser` attaches to the first tab it finds: one in the background. A page that doesn't show
++   * draws nothing and answers no pointer event. Measured on Chrome 156 with `agent-browser` 0.39.1: each
++   * `mouse move` there waited out 5 s, so a click's path ran into the 33 s of its batch (17% of the clicks and 41%
++   * of the fills of a day on one computer), a page's timers ran once a second, and a live view got no picture.
++   * `agent-browser`'s own tab switch brings a tab to the front, so it is told to switch to the tab it holds.
++   * Never an answer of its own: a look that fails, or a tab still hidden after it was brought up (a window someone
++   * minimized on the agent's desktop comes back up; one that can't is left), is tried again later and the command
++   * goes on.
++   */
++  private async foreground(session: Session, signal?: AbortSignal): Promise<void> {
++    if (!session.chrome || (session.shownUntil !== undefined && this.now() < session.shownUntil)) return;
++    const opts = { timeoutMs: QUICK_TIMEOUT_MS, ...(signal ? { signal } : {}) };
++    const later = () => {
++      session.shownUntil = this.now() + SHOWN_RETRY_MS;
++    };
++    const seen = await this.run(session, ["eval", "document.visibilityState"], opts);
++    const state = isRecord(seen.data) ? seen.data.result : null;
++    if (state !== "hidden") {
++      if (state !== "visible") return later();
++      session.shownUntil = this.now() + SHOWN_MS;
++      session.broughtUp = false;
++      return;
++    }
++    // Brought to the front the last time, and still hidden: it can't show now.
++    if (session.broughtUp) return later();
++    const tabs = await this.run(session, ["tab"], opts);
++    const list = isRecord(tabs.data) && Array.isArray(tabs.data.tabs) ? tabs.data.tabs : [];
++    const held = list.find((t) => isRecord(t) && t.active === true);
++    const id = isRecord(held) && typeof held.tabId === "string" ? held.tabId : null;
++    if (!id || !(await this.run(session, ["tab", id], opts)).success) return later();
++    session.shownUntil = this.now() + SHOWN_MS;
++    session.broughtUp = true;
++    this.opts.log(`the browser of ${session.agent.handle} brought its tab to the front`);
++  }
++
+   /**
+    * A `click`, `dblclick`, `hover`, `fill` or `type` on one element as a person does it (`humanSteps`), in two
+    * batches: the element's box and the viewport, then the pointer path and the press or the keys. Only an element
+@@ -2935,6 +2984,8 @@ export class BrowserManager {
+       session.outdatedAt = undefined;
+       session.headed = chrome.display !== undefined;
+       session.aliveAt = null;
++      session.shownUntil = undefined;
++      session.broughtUp = false;
+       session.memory = this.memoryCounters();
+       await this.rememberChrome(chrome.pid, profile, chrome.display);
+       void chrome.exited.then(() => {
+@@ -4091,6 +4142,8 @@ export class BrowserManager {
+         status = await this.run(session, ["stream", "status"], { timeoutMs: QUICK_TIMEOUT_MS });
+         if (disconnected(status)) return null;
+       }
++      // A tab in the background sends no picture: the person would watch a still page.
++      await this.foreground(session);
+       if (!isRecord(status.data) || status.data.enabled !== true) {
+         await this.run(session, ["stream", "enable"], { timeoutMs: QUICK_TIMEOUT_MS });
+         status = await this.run(session, ["stream", "status"], { timeoutMs: QUICK_TIMEOUT_MS });
+diff --git a/apps/server/test/runner/browser.test.ts b/apps/server/test/runner/browser.test.ts
+index c4c481679..d88f6f9a7 100644
+--- a/apps/server/test/runner/browser.test.ts
++++ b/apps/server/test/runner/browser.test.ts
+@@ -214,7 +214,7 @@ function setup(over: Partial<BrowserManagerOptions> = {}, secrets: Record<string
+       ...(extra.allowedDomains ? { allowedDomains: extra.allowedDomains } : {}),
+     });
+   // The fake appends one line per call: a line still being written (no newline yet) is left for the next read.
+-  const logged = (): Logged[] =>
++  const everyCall = (): Logged[] =>
+     existsSync(log)
+       ? readFileSync(log, "utf8")
+           .split("\n")
+@@ -222,11 +222,13 @@ function setup(over: Partial<BrowserManagerOptions> = {}, secrets: Record<string
+           .filter(Boolean)
+           .map((l) => JSON.parse(l) as Logged)
+       : [];
++  // Without the runner's own look at whether the agent's tab shows (`foreground`), which goes before any command.
++  const logged = (): Logged[] => everyCall().filter((l) => l.args.at(-1) !== "document.visibilityState");
+   const page = (patch: Record<string, unknown>) => {
+     const cur = existsSync(stateFile) ? JSON.parse(readFileSync(stateFile, "utf8")) : {};
+     writeFileSync(stateFile, JSON.stringify({ ...cur, ...patch }));
+   };
+-  return { ws, home, manager, frames, sockets, folder, act, logged, page, chromes: chromes.started };
++  return { ws, home, manager, frames, sockets, folder, act, logged, everyCall, page, chromes: chromes.started };
+ }
+ 
+ class FakeSocket implements StreamSocket {
+@@ -656,6 +658,57 @@ test("a click goes as a person's: the box, then a pointer path into it, a check
+   expect(t.logged().at(-1)?.args.slice(-4)).toEqual(["drag", "@e1", "@e2", "--human"]);
+ });
+ 
++test("a tab in the background comes to the front before a command; one that shows is left alone", async () => {
++  let now = 1_000_000;
++  const logs: string[] = [];
++  const t = setup({ now: () => now, log: (l) => logs.push(l) });
++  const calls = () => t.everyCall().map((l) => l.args.slice(l.args.indexOf("--screenshot-dir") + 2).join(" "));
++  const LOOK = "eval document.visibilityState";
++  // Chrome came up with the tabs it had: the one `agent-browser` holds is behind the page Chrome started on.
++  t.page({ hidden: true });
++  expect(await t.act("open", ["https://a.example/"])).toMatchObject({ success: true });
++  // Looked at, found hidden, switched to again (which brings it to the front), then the command.
++  expect(calls()).toEqual([LOOK, "tab", "tab t1", "open https://a.example/"]);
++  expect(logs).toContain("the browser of dev brought its tab to the front");
++
++  // The commands of one batch share that look; a second later it is looked at again, and shows.
++  expect(await t.act("snapshot")).toMatchObject({ success: true });
++  expect(
++    calls()
++      .slice(4)
++      .filter((c) => c === LOOK),
++  ).toEqual([]);
++  now += 1_001;
++  expect(await t.act("snapshot")).toMatchObject({ success: true });
++  expect(calls().filter((c) => c === LOOK)).toHaveLength(2);
++  expect(calls().filter((c) => c === "tab t1")).toHaveLength(1);
++
++  // A tab that stays hidden (a window that can't come up) doesn't fail the command, and isn't tried at each one.
++  t.page({ hidden: true, staysHidden: true });
++  now += 1_001;
++  expect(await t.act("snapshot")).toMatchObject({ success: true });
++  now += 1_001;
++  expect(await t.act("snapshot")).toMatchObject({ success: true });
++  now += 1_001;
++  expect(await t.act("snapshot")).toMatchObject({ success: true });
++  expect(calls().filter((c) => c === "tab t1")).toHaveLength(2);
++  // Once it shows again, the next time it hides it is brought up as before.
++  t.page({ hidden: false, staysHidden: false });
++  now += 30_000;
++  expect(await t.act("snapshot")).toMatchObject({ success: true });
++  t.page({ hidden: true });
++  now += 1_001;
++  expect(await t.act("snapshot")).toMatchObject({ success: true });
++  expect(calls().filter((c) => c === "tab t1")).toHaveLength(3);
++
++  // Switching tabs and waiting need no page in front.
++  const before = calls().filter((c) => c === LOOK).length;
++  now += 31_000;
++  expect(await t.act("tab", ["2"])).toMatchObject({ success: true });
++  expect(await t.act("wait", ["10"])).toMatchObject({ success: true });
++  expect(calls().filter((c) => c === LOOK)).toHaveLength(before);
++});
++
+ test("an action on a point of the page: the pointer goes along a path, text as keys when a field has the focus", async () => {
+   const t = setup();
+   await t.act("open", ["https://shop.example.com"]);
+diff --git a/apps/server/test/runner/fake-agent-browser.mjs b/apps/server/test/runner/fake-agent-browser.mjs
+index 45c11f691..378712060 100644
+--- a/apps/server/test/runner/fake-agent-browser.mjs
++++ b/apps/server/test/runner/fake-agent-browser.mjs
+@@ -170,7 +170,9 @@ switch (command) {
+   case "tab":
+     // `tab <n>`: switch to a tab that is on `tabTo` (a link that opened a new tab).
+     if (/^\d+$/.test(args[0] ?? "") && state.tabTo) state.url = state.tabTo;
+-    out({ success: true, data: {} });
++    // `tab t1`: the tab it holds comes to the front. `tab`: its tabs.
++    if (args[0] === "t1" && !state.staysHidden) state.hidden = false;
++    out({ success: true, data: args.length === 0 ? { tabs: [{ tabId: "t1", active: true }] } : {} });
+     break;
+   case "batch": {
+     const list = JSON.parse(stdin || "[]");
+@@ -250,10 +252,19 @@ switch (command) {
+     break;
+   }
+   case "eval":
+-    // The page's size, or a settle check (true).
++    // The page's size, whether its tab shows, or a settle check (true).
+     out({
+       success: true,
+-      data: { result: args.join(" ").includes("innerWidth") ? [1280, 800] : true, origin: state.url },
++      data: {
++        result: args.join(" ").includes("innerWidth")
++          ? [1280, 800]
++          : args.at(-1) === "document.visibilityState"
++            ? state.hidden
++              ? "hidden"
++              : "visible"
++            : true,
++        origin: state.url,
++      },
+     });
+     break;
+   case "upload":
+diff --git a/docs/adr/0040-agent-browser.md b/docs/adr/0040-agent-browser.md
+index 3dbd3a1df..cfabd28eb 100644
+--- a/docs/adr/0040-agent-browser.md
++++ b/docs/adr/0040-agent-browser.md
+@@ -242,6 +242,17 @@ A person in control could type but not click: the page looked enlarged and every
+ - The first picture of an idle page (a screenshot) says the size the page answers (`Page.getLayoutMetrics` on the tab's socket, else `window.innerWidth`/`innerHeight`), not the stream's status.
+ - A picture that can't be read keeps the stream's label.
+ 
++### 19. The agent's tab is in front before a command (2026-11-14)
++
++On one computer over a day, 17% of the agents' clicks and 41% of their fills answered "The browser didn't answer within 33 s" (53 of the 61 that took over 30 s), each exactly at the limit of the batch that presses as a person does (`HELD_PRESS_MS`), in headless Chrome and on the agents' desktops alike. Chrome starts with the tabs it had (`--restore-last-session`, section 13) and shows the page it was started on, while `agent-browser` attaches to the first tab it finds: one in the background. A page that doesn't show draws nothing and answers no pointer event. Measured on Chrome 156 with `agent-browser` 0.39.1: each `mouse move` on such a tab waits out 5 s, so a pointer path of twenty moves never ends; its timers run once a second (the settle waits); and a live view gets no picture. Brought to the front, the same move takes 12 ms and the same click 0.7 s.
++
++- Before a command that needs the page, the runner asks the tab whether it shows (`document.visibilityState`), at most once a second, so the commands of one batch share one look. A hidden one is brought to the front by `agent-browser`'s own tab switch, to the tab it already holds (`foreground`).
++- A live view that opens does the same first.
++- It never fails a command. A look that can't be read, or a tab still hidden after it was brought up, is left for 30 s: on an agent's desktop a minimized window comes back up, and one that can't show is not asked at every command.
++- `tab`, `wait`, `dialog` and the page size are not preceded by it.
++
++Not covered here: a click that opens a new window answers after 30 s ("CDP command timed out: Input.dispatchMouseEvent") while the runner's traffic counter is attached with `Target.setAutoAttach` on the browser (5 of the same 61). Measured: with target discovery and `Target.attachToTarget` in its place the same press takes 0.1 s. That connection also guards typed passwords (ADR 0144), so it changes on its own.
++
+ ## Order
+ 
+ First version: stages 0–7. Difficulty: **easy** (known pattern, little risk), **medium** (new pieces on known patterns).
+-- 
+2.43.0
+

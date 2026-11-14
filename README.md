@@ -1,23 +1,38 @@
 # agentes.chat: VM dos agentes e navegador rápido
 
-Como deixamos a nossa instalação do [agentes.chat](https://github.com/agentes-chat/agentes-chat) com cada agente trabalhando numa tela própria (a "VM") e com o navegador respondendo em menos de um segundo.
+Tudo o que fizemos na nossa instalação do [agentes.chat](https://github.com/agentes-chat/agentes-chat) para cada agente trabalhar numa tela própria (a "VM") e para o navegador responder em menos de um segundo, com o código e os scripts para repetir do começo ao fim.
 
-São duas partes independentes:
+| O que tem aqui | Para quê |
+| --- | --- |
+| [`scripts/instalar-vm.sh`](scripts/instalar-vm.sh) | Diz o que falta para a VM, instala e liga |
+| [`patches/`](patches) | Os seis consertos do navegador, prontos para `git am` |
+| [`scripts/aplicar-navegador.sh`](scripts/aplicar-navegador.sh) | Aplica os consertos, monta o runner e troca o deste computador |
+| [`repro/medir.ts`](repro/medir.ts) | Reproduz os defeitos e mede o antes e o depois num Chrome de verdade |
+| [`scripts/conferir.sh`](scripts/conferir.sh) | Lê o log do runner e diz se os agentes ainda travam |
+| [`docs/como-funciona.md`](docs/como-funciona.md) | O que cada conserto muda e por quê |
 
-1. **A VM dos agentes** já vem no agentes.chat. É só instalar os pacotes e ligar. Não muda código.
-2. **O navegador rápido** são seis consertos nossos no runner. Estão propostos ao projeto no [PR #437](https://github.com/agentes-chat/agentes-chat/pull/437). Enquanto ele não entra, dá para aplicar por conta própria.
+São duas partes independentes. A VM já vem no agentes.chat: é instalar e ligar, sem mudar código. O navegador rápido são seis consertos nossos no runner, propostos ao projeto no [PR #437](https://github.com/agentes-chat/agentes-chat/pull/437); enquanto ele não entra, este repositório aplica por conta própria.
 
-Onde isso roda aqui: Ubuntu 24.04, o próprio servidor como computador dos agentes, em modo simples (todos os agentes como um usuário só, `agentes`), Google Chrome 156 e `agent-browser` 0.39.1. O que não testamos está dito em cada parte.
+**Onde isso foi testado:** Ubuntu 24.04, o próprio servidor como computador dos agentes, em modo simples (todos os agentes como um usuário só), Google Chrome 156, `agent-browser` 0.39.1, Bun 1.4.4. Os patches foram feitos sobre o `main` do agentes.chat de 14/11/2026 (commit `59e1ed178`).
 
-## 1. Ligar a VM dos agentes
+**Não testado:** modo `--system`, Mac, Windows, Chromium em ARM, `instalar-vm.sh --instalar` (aqui os pacotes já estavam instalados e não temos sudo nesse usuário; o modo que só confere foi testado).
 
-O guia oficial cobre tudo em [`SELF_HOSTING.md`](https://github.com/agentes-chat/agentes-chat/blob/main/SELF_HOSTING.md), nas seções "This server as the agents' computer" e "Desktops and terminal (Linux)". O caminho curto:
+```sh
+git clone https://github.com/zimcontent/agentes-chat-vm-navegador.git
+cd agentes-chat-vm-navegador
+```
 
-**Requisitos:** Linux com systemd. Mac e Windows não têm VM: lá o navegador do agente roda sem janela.
+## Parte 1: ligar a VM dos agentes
 
-**Servidor novo.** O instalador pergunta se o servidor também vai ser o computador dos agentes e o que instalar nele (navegador, telas, Claude Code, Codex). Responda sim.
+A VM é uma tela Linux por agente (Xtigervnc com XFCE). O navegador do agente abre nela, você assiste ao vivo pela página do agente e assume o controle para fazer um login por ele. Só existe no Linux; em Mac e Windows o navegador do agente roda sem janela.
 
-**Servidor que já existe.** Como root, na pasta onde está o `.env` (troque 3000 pela sua porta, se mudou):
+### 1.1 Ter um computador conectado
+
+Escolha um:
+
+**a) Servidor novo.** O instalador do agentes.chat pergunta se o servidor também vai ser o computador dos agentes e o que instalar nele (navegador, telas, Claude Code, Codex). Responda sim a tudo e pule para o passo 1.3.
+
+**b) Servidor que já roda, usando ele mesmo como computador.** Como root, na pasta onde está o `.env` (troque 3000 pela sua porta, se mudou):
 
 ```sh
 (umask 077 && openssl rand -base64 48 | tr -d '\n' > /root/host-computer-token)
@@ -27,11 +42,18 @@ curl -fsSL http://127.0.0.1:3000/api/machines/install.sh | sh -s -- --system --d
   --server http://127.0.0.1:3000 --host-token-file /root/host-computer-token
 ```
 
-Em menos de um minuto ele aparece como "This server's computer" na organização. `HOST_COMPUTER_TOKEN` não funciona com cadastro aberto (`ALLOW_SIGNUP=true`).
+Em menos de um minuto ele aparece como "This server's computer" na organização. Não funciona com cadastro aberto (`ALLOW_SIGNUP=true`). No Ubuntu o systemd não tem o que o `--system` precisa, e a instalação oferece o **modo simples** (todos os agentes como o usuário `agentes`). É o que usamos.
 
-No Ubuntu o systemd não tem o que o modo `--system` precisa, e o instalador oferece o modo simples. É o que usamos.
+**c) Outro computador Linux.** No app, em Configurações › Dispositivos, conecte o computador com o comando que a tela mostra. Depois siga para o 1.2.
 
-**Num computador já conectado**, só os pacotes e a chave:
+### 1.2 Instalar os pacotes e ligar (caso c, ou um computador conectado antes)
+
+```sh
+scripts/instalar-vm.sh              # só diz o que falta
+scripts/instalar-vm.sh --instalar   # instala (pede sudo) e liga a tela e o terminal
+```
+
+O que o script faz, se preferir à mão:
 
 ```sh
 sudo apt install --no-install-recommends tigervnc-standalone-server xauth dbus-x11 xfce4-session \
@@ -40,49 +62,80 @@ sudo apt install --no-install-recommends tigervnc-standalone-server xauth dbus-x
 agentes-runner tools enable desktop terminal
 ```
 
-Mantenha o `--no-install-recommends`: sem ele cada tela ganha um bloqueio de tela que ninguém consegue destravar.
+Mantenha o `--no-install-recommends`: sem ele cada tela ganha um bloqueio de tela que ninguém consegue destravar. O navegador é o Google Chrome (o `.deb` de google.com/chrome); em ARM, o Chromium.
 
-**No app:**
+### 1.3 No app
 
-- O agente precisa da permissão **Use its desktop** (agentes novos já têm).
-- Na página do agente, abra a tela dele para assistir ao vivo e use "assumir o controle" para fazer um login por ele. O login fica salvo no navegador do agente.
-- Para o agente usar programas da tela sozinho (clicar, digitar, ler), o guia oficial pede o modo `--system`, mais pacotes e a permissão **Run code**: seção "Agents using apps on their desktops". Não usamos isso aqui.
+1. Abra o agente e confira a permissão **Use its desktop** (agentes novos já têm).
+2. Na página do agente, abra a tela dele. Ela liga no primeiro uso e fica ligada.
+3. Para fazer um login pelo agente: assuma o controle, entre no site e devolva. O login fica no navegador do agente.
 
-**Conferir:** `agentes-runner status` diz se a tela e o terminal podem rodar e o que falta. `agentes-runner desktop-check --agent <nome>` (com o runner parado) liga a tela do agente, entra nela e desliga.
+Para o agente usar programas da tela sozinho (clicar, digitar, ler), o agentes.chat exige o modo `--system`, mais pacotes (`scripts/instalar-vm.sh --instalar --apps`) e a permissão **Run code**. Não usamos isso aqui.
 
-**Memória:** cerca de 0,2 GB por tela, 0,8 GB com o navegador aberto nela. A tela liga no primeiro uso e fica ligada.
+### 1.4 Conferir
 
-## 2. Navegador rápido
+```sh
+agentes-runner status                          # diz se tela e terminal podem rodar e o que falta
+agentes-runner desktop-check --agent <nome>    # com o runner parado: liga a tela, entra e desliga
+```
 
-### O que estava errado
+No computador do próprio servidor, o `status` pode dizer "Desktops: off" com a tela funcionando (acontece aqui); vale o que o app mostra.
+
+**Memória:** cerca de 0,2 GB por tela, 0,8 GB com o navegador aberto nela. O runner só liga uma tela com 1,5 GB livres.
+
+O guia oficial tem o resto dos detalhes: [`SELF_HOSTING.md`](https://github.com/agentes-chat/agentes-chat/blob/main/SELF_HOSTING.md), seções "This server as the agents' computer" e "Desktops and terminal (Linux)".
+
+## Parte 2: navegador rápido
+
+### 2.1 O que estava errado
 
 | O que se via | Causa |
 | --- | --- |
-| 17% dos cliques e 41% dos preenchimentos dos agentes davam "The browser didn't answer within 33 s" | O Chrome restaura as abas antigas e o agente pode ficar ligado a uma aba em segundo plano. Aba escondida não responde ao mouse. |
+| 17% dos cliques e 41% dos preenchimentos dos agentes: "The browser didn't answer within 33 s" | O Chrome restaura as abas antigas e o agente pode ficar ligado a uma aba em segundo plano. Aba escondida não responde ao mouse. |
 | Clique que abre janela nova ("Continuar com Google") falhava depois de 30 s, embora tivesse funcionado | O contador de tráfego do runner pedia ao Chrome para se ligar sozinho a toda aba nova, e isso segura a resposta do clique. |
 | Pessoa no controle: "isso não chegou à página" num desafio do Cloudflare | A entrada dela passava por uma fila que o próprio navegador mantém ocupada. |
-| Pessoa no controle conseguia digitar mas não clicar; a página parecia ampliada | Toda imagem saía rotulada como 1280×720, qualquer que fosse o tamanho da página. |
+| Pessoa no controle digitava mas não clicava; a página parecia ampliada | Toda imagem saía rotulada como 1280×720, qualquer que fosse o tamanho da página. |
 | Assumir o controle não parava o agente | Só o clique era interrompido; leituras e esperas seguiam. |
 
-### Antes e depois
+O ganho não vem de modelo de IA. A parte que encontra o botão na página (Jev) é a do próprio agentes.chat e não mudou. O tempo se perdia abaixo dela, entre o runner e o Chrome. Os detalhes de cada conserto estão em [`docs/como-funciona.md`](docs/como-funciona.md).
 
-Medido com Chrome 156 de verdade:
+### 2.2 Reproduzir o defeito (opcional, uns 5 minutos)
 
-| Ação | Antes | Depois |
-| --- | --- | --- |
-| Clique em botão, lista, link de download, botão de arquivo | 33 s, falha | 0,7 a 0,9 s |
-| Preencher 30 letras, digitando como pessoa | 33 s, falha | 3,3 s |
-| Clique que abre janela nova | 30 s, falha | 0,8 s |
+Precisa de [Bun](https://bun.sh), Google Chrome e um checkout do agentes.chat **sem** os consertos:
 
-Vale para o navegador sem janela e para o que roda na VM do agente.
+```sh
+git clone https://github.com/agentes-chat/agentes-chat.git ../agentes-chat
+(cd ../agentes-chat && git checkout 59e1ed178 && bun install --frozen-lockfile)
+bun repro/medir.ts ../agentes-chat ./estado-antes
+```
 
-O ganho não vem de modelo de IA. A parte que encontra o botão na página (Jev) é a do próprio agentes.chat e não mudou. O tempo se perdia abaixo dela, entre o runner e o Chrome.
+O script abre o navegador três vezes na mesma pasta, porque o defeito da aba escondida só aparece quando o Chrome volta com abas de antes. Saída que tivemos:
 
-### Aplicar
+```
+rodada 3: a aba do agente está hidden logo depois de abrir
+│ rodada │ acao                        │ tempo  │ resultado                                               │
+│ 1      │ clique num botão            │ 0.7 s  │ ok                                                      │
+│ 1      │ preencher 30 letras         │ 3.1 s  │ ok                                                      │
+│ 1      │ clique que abre janela nova │ 30.3 s │ falhou: CDP command timed out: Input.dispatchMouseEvent │
+│ 3      │ clique num botão            │ 40.0 s │ falhou: The browser didn't answer within 40 s           │
+│ 3      │ preencher 30 letras         │ 40.0 s │ falhou: The browser didn't answer within 40 s           │
+```
 
-Os seis commits estão no nosso fork público, no branch [`fix/agent-browser-clicks`](https://github.com/zimcontent/agentes-chat/tree/fix/agent-browser-clicks), em cima do `main` do agentes.chat de 14/11/2026. Mexem só no runner (e em quatro arquivos pequenos do servidor para a parte de "pessoa no controle").
+Em qual rodada a aba fica escondida pode variar. `RODADAS=5` roda mais vezes; `VER_LOG=1` mostra o log do runner.
 
-**Se você roda de um fork seu** (é o nosso caso): traga os commits para o seu `main` e monte a imagem como sempre. O app passa a entregar o runner novo.
+### 2.3 Aplicar os consertos
+
+**Regra que vale para os dois caminhos:** use o código da **mesma versão que o seu servidor roda**. Runner e servidor falam um protocolo com número, e um runner de outra versão pode ser recusado.
+
+#### Caminho A: você monta a sua imagem a partir de um fork (o que dura)
+
+É o nosso caso. No seu fork:
+
+```sh
+git am /caminho/de/agentes-chat-vm-navegador/patches/*.patch
+```
+
+ou, pelo nosso fork público:
 
 ```sh
 git remote add zim https://github.com/zimcontent/agentes-chat.git
@@ -90,39 +143,80 @@ git fetch zim fix/agent-browser-clicks
 git cherry-pick 49f25d028^..e0280e284
 ```
 
-**Se você só quer o runner agora**, num computador em modo simples. Precisa do [Bun](https://bun.sh) e do código da mesma versão que o seu servidor roda:
+Monte a imagem e suba como sempre. O app passa a entregar o runner novo, e `agentes-runner update` (ou a própria instalação, no computador do servidor) leva ele aos computadores.
+
+#### Caminho B: trocar só o runner deste computador (rápido, provisório)
+
+Para modo simples, em que o runner roda como o seu usuário:
 
 ```sh
-# no checkout do agentes.chat, na versão do seu servidor
-git remote add zim https://github.com/zimcontent/agentes-chat.git
-git fetch zim fix/agent-browser-clicks
-git cherry-pick 49f25d028^..e0280e284
-bun install --frozen-lockfile
-bun build apps/server/runner/main.ts --target=node --banner '#!/usr/bin/env node' \
-  --outfile /tmp/agentes-runner.mjs
+# 1. o código do agentes.chat na versão do seu servidor
+git clone https://github.com/agentes-chat/agentes-chat.git ../agentes-chat
+(cd ../agentes-chat && git checkout <commit ou tag da sua instalação>)
 
-# como o usuário que roda o runner
-cp ~/.agentes-runner/agentes-runner.mjs ~/agentes-runner.anterior.mjs
-cp /tmp/agentes-runner.mjs ~/.agentes-runner/agentes-runner.mjs
+# 2. aplica, monta e confere a versão contra o servidor; não troca nada
+scripts/aplicar-navegador.sh ../agentes-chat --servidor http://127.0.0.1:3000
+
+# 3. com os agentes parados, troca o runner e reinicia o serviço
+scripts/aplicar-navegador.sh ../agentes-chat --trocar
+```
+
+O passo 2 monta o runner do checkout **antes** de aplicar e compara com o que o servidor entrega em `/runner/agentes-runner.mjs`. Se forem iguais, o checkout é a versão certa. Se disser `DIFERENTE`, é outra versão do código ou outro Bun (a comparação só bate com o mesmo Bun que montou a imagem; aqui, 1.4.4): ache a versão certa antes de trocar.
+
+O passo 3 guarda o runner atual em `~/.agentes-runner/agentes-runner.anterior.mjs`, troca, reinicia o serviço de usuário `agentes-runner.service` e, se ele não subir, volta sozinho ao anterior.
+
+Cuidados do caminho B:
+
+- **É provisório.** `agentes-runner update` e a atualização do servidor baixam o runner que o app entrega e desfazem a troca. Para durar, caminho A.
+- Reiniciar o runner não fecha as telas dos agentes, mas corta o que eles estiverem fazendo, e fecha o Chrome deles (reabre no próximo uso, com os logins).
+- Um dos seis consertos toca também quatro arquivos do servidor (com a pessoa no controle, recusar os comandos do agente). Só com o runner trocado, os cliques e preenchimentos dos agentes já ficam rápidos, que é o principal; a parte completa de "pessoa no controle" precisa do caminho A.
+- No modo `--system` o runner fica em `/opt/agentes-runner` e é do root. O script não cobre esse caso.
+
+**Para desfazer:**
+
+```sh
+cp ~/.agentes-runner/agentes-runner.anterior.mjs ~/.agentes-runner/agentes-runner.mjs
 systemctl --user restart agentes-runner.service
 ```
 
-Cuidados:
+### 2.4 Medir o depois
 
-- **Use a versão do seu servidor.** Runner e servidor falam um protocolo com número; um runner montado de outra versão pode ser recusado.
-- **`agentes-runner update` desfaz a troca**, e a atualização do servidor também: os dois baixam o runner que o app entrega. Por isso o caminho do fork é o que dura.
-- Reiniciar o runner não fecha as telas dos agentes, mas corta o que eles estiverem fazendo. Faça com eles parados.
-- Para voltar: copie o `agentes-runner.anterior.mjs` de volta e reinicie.
-- No modo `--system` o runner fica em `/opt/agentes-runner` e é do root. Não testamos a troca manual lá.
+```sh
+bun repro/medir.ts ../agentes-chat ./estado-depois
+```
 
-**Conferir que pegou:** depois do primeiro comando de navegador de um agente, o log do runner (`journalctl --user -u agentes-runner.service`) mostra `the browser of <agente> brought its tab to the front` quando a aba estava escondida, e os erros de 33 s somem.
+Saída que tivemos, com os consertos:
 
-### O que testamos e o que não
+```
+│ rodada │ acao                        │ tempo │ resultado │
+│ 1      │ clique num botão            │ 0.7 s │ ok        │
+│ 1      │ preencher 30 letras         │ 3.1 s │ ok        │
+│ 1      │ clique que abre janela nova │ 0.6 s │ ok        │
+│ 3      │ clique num botão            │ 0.7 s │ ok        │
+│ 3      │ preencher 30 letras         │ 2.8 s │ ok        │
+│ 3      │ clique que abre janela nova │ 0.7 s │ ok        │
+```
 
-- Testes do runner e do navegador passam (206 mais 133), com tipos e lint.
-- Roda em produção aqui desde 14/11/2026, em modo simples no Ubuntu 24.04.
-- Não testado: modo `--system`, Mac, Windows, Chromium em ARM, outras versões do `agent-browser`.
+### 2.5 Conferir em produção
+
+```sh
+scripts/conferir.sh                 # últimas 24 horas
+scripts/conferir.sh "7 days ago"
+```
+
+Ele conta, no log do runner, os cliques e preenchimentos dos agentes e quantos passaram de 30 s. No nosso servidor, de 13/11 até a troca do runner: 99 cliques, 31 com 30 s ou mais; 42 preenchimentos, 20 com 30 s ou mais. Depois, a linha `the browser of <agente> brought its tab to the front` aparece quando uma aba escondida é trazida de volta.
+
+### 2.6 Os testes do próprio projeto
+
+No checkout com os consertos:
+
+```sh
+bun test apps/server/test/runner/browser.test.ts apps/server/test/runner/browser-traffic.test.ts \
+  packages/engine/test/browser-handoff.test.ts
+```
+
+Aqui: 206 passam, 0 falham.
 
 ## Licença
 
-Os commits seguem a licença do agentes.chat (AGPL-3.0-only). Este texto pode ser copiado à vontade.
+Os arquivos em `patches/` são mudanças no agentes.chat e seguem a licença dele, AGPL-3.0-only. O resto deste repositório (scripts, medição e textos) é MIT: veja [`LICENSE`](LICENSE).

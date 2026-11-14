@@ -1,0 +1,257 @@
+From 61e1401298cc5599580b7ed49b93f3577e276af7 Mon Sep 17 00:00:00 2001
+From: Gabriel Zim <info@zimcontent.com>
+Date: Fri, 13 Nov 2026 17:16:25 -0300
+Subject: [PATCH 4/6] fix(runner): a frame says the size of the page it shows,
+ so a click lands
+
+A person in control could type but not click, and the page looked
+enlarged. agent-browser labels every frame of its stream 1280x720 (and
+says the same in its status) whatever the page's size, and the apps map a
+click on the picture with that label. On a sign-in window 500 pixels wide
+a click on the email field went out 2.5 times too far.
+
+Each frame now goes out with the size of its own picture, which is the
+page's on a screen of density 1 that fits the stream (headless, and the
+agents' desktops). With a person in control the tab says its size itself
+(Page.getLayoutMetrics on its socket), read once per tab and picture
+size. The first picture of an idle page says the size the page answers,
+not the status's. ADR 0040 section 18.
+
+Co-Authored-By: Claude Fable 5.2 <noreply@anthropic.com>
+---
+ apps/server/runner/browser.ts           | 82 +++++++++++++++++++++----
+ apps/server/test/runner/browser.test.ts | 26 +++++++-
+ docs/adr/0040-agent-browser.md          |  8 +++
+ 3 files changed, 102 insertions(+), 14 deletions(-)
+
+diff --git a/apps/server/runner/browser.ts b/apps/server/runner/browser.ts
+index 731ac6bd2..2f1ca1d4f 100644
+--- a/apps/server/runner/browser.ts
++++ b/apps/server/runner/browser.ts
+@@ -1074,6 +1074,13 @@ const BATCH_STEP_MS = 8;
+ const HELD_PRESS_MS = 33_000;
+ const VIEWPORT = "[window.innerWidth, window.innerHeight]";
+ 
++/** A page's size in its own pixels, or null when what was read isn't one. */
++function pageSize(width: unknown, height: unknown): { width: number; height: number } | null {
++  const w = Math.round(Number(width));
++  const h = Math.round(Number(height));
++  return Number.isFinite(w) && Number.isFinite(h) && w > 0 && h > 0 ? { width: w, height: h } : null;
++}
++
+ /**
+  * Run before every `snapshot`: a button or link with no words of its own (an icon, or an icon font's ligature such as
+  * "content_copy") gets an `aria-label` from what names it to a person, so the snapshot shows its name. Chrome's
+@@ -1627,6 +1634,13 @@ interface Stream {
+   page?: PageLink;
+   /** The page's size in CSS pixels, from the stream's status. */
+   viewport?: { width: number; height: number };
++  /**
++   * The size of the page its frames show, read from the tab itself while a person drives it (`measureShown`), for the
++   * tab and picture size of `key`.
++   */
++  shown?: { key: string; width: number; height: number };
++  /** The `key` being read now. */
++  measuring?: string;
+   /** A frame went out on this stream. */
+   framed?: boolean;
+   /** Closed by us (stop, mode off): no `ended` frame for an expected close. */
+@@ -4239,6 +4253,7 @@ export class BrowserManager {
+       return;
+     }
+     const scale = Number(m.pageScaleFactor);
++    const shown = this.shownSize(session, stream, msg.data) ?? { width, height };
+     session.lastUsed = this.now();
+     stream.framed = true;
+     // Newest wins: the live view's window (`BrowserViews`) holds only the newest while the link is busy.
+@@ -4248,8 +4263,8 @@ export class BrowserManager {
+       seq,
+       data: msg.data,
+       metadata: {
+-        deviceWidth: width,
+-        deviceHeight: height,
++        deviceWidth: shown.width,
++        deviceHeight: shown.height,
+         ...(Number.isFinite(scale) ? { pageScaleFactor: scale } : {}),
+         capturedAt: captureTime(m.timestamp) ?? this.now(),
+         ...pageMeta(session, stream),
+@@ -4263,6 +4278,40 @@ export class BrowserManager {
+     (stream.owedTimer as { unref?: () => void }).unref?.();
+   }
+ 
++  /**
++   * The size of the page a frame shows, which is where a person's click on it lands. `agent-browser` labels every
++   * frame 1280×720 whatever the page's size (a 500 pixel wide sign-in window, a 1264 pixel wide tab), so a click
++   * mapped with its label lands somewhere else on the page. The picture's own pixels are the page's on a screen of
++   * density 1 that fits the stream (headless and the agents' desktops); while a person drives, the tab says its
++   * size itself, read once per tab and picture size. Null when the picture can't be read: the label stays.
++   */
++  private shownSize(session: Session, stream: Stream, data: string): { width: number; height: number } | null {
++    // The start of the file holds its size: 64 KiB of it at most.
++    const picture = jpegSize(Buffer.from(data.slice(0, 87_380), "base64"));
++    if (!picture) return null;
++    const key = `${stream.targetId ?? ""}:${picture.width}x${picture.height}`;
++    if (stream.shown?.key === key) return stream.shown;
++    if (this.driving(session) && stream.measuring !== key) void this.measureShown(session, stream, key);
++    return picture;
++  }
++
++  private async measureShown(session: Session, stream: Stream, key: string) {
++    stream.measuring = key;
++    try {
++      const link = await this.pageLink(session, stream);
++      const metrics = link
++        ? await this.pageCall(link, { method: "Page.getLayoutMetrics", params: {} }, QUICK_TIMEOUT_MS)
++        : null;
++      const layout = metrics && isRecord(metrics.result) ? metrics.result.cssLayoutViewport : null;
++      const size = isRecord(layout) ? pageSize(layout.clientWidth, layout.clientHeight) : null;
++      if (size && session.stream === stream) stream.shown = { key, ...size };
++    } catch {
++      // not read: the picture's own size stays
++    } finally {
++      if (stream.measuring === key) stream.measuring = undefined;
++    }
++  }
++
+   /**
+    * An agent's live view has room for its next frame again, or it ended (`BrowserViews.onRoom`; in system mode
+    * root's `browser.room`): its stream's frame waiting for that is acknowledged, and `agent-browser` sends the newest.
+@@ -4308,8 +4357,11 @@ export class BrowserManager {
+     });
+     const waiting = () => session.stream === stream && !stream.framed && !this.closed && !!stream.viewport;
+     if (!waiting()) return;
+-    const sendShot = (data: string) => {
+-      const size = stream.viewport;
++    // The picture is of the page as it is, so its size is the page's own: the stream's `status` says 1280×720 for a
++    // page of any size (a 500 pixel wide sign-in window among them), and a click on a picture labelled with a width
++    // the page doesn't have lands somewhere else on it.
++    const sendShot = (data: string, page: { width: number; height: number } | null) => {
++      const size = page ?? stream.viewport;
+       if (!data || data.length > BROWSER_LIMITS.frameBytes || !size || !waiting()) return;
+       stream.framed = true;
+       this.opts.send({
+@@ -4329,13 +4381,17 @@ export class BrowserManager {
+     // in front of their input, nor holding that queue while they type.
+     const link = this.driving(session) ? await this.pageLink(session, stream) : null;
+     if (link) {
+-      const shot = await this.pageCall(
+-        link,
+-        { method: "Page.captureScreenshot", params: { format: "jpeg", quality: 70 } },
+-        QUICK_TIMEOUT_MS,
+-      );
++      const [shot, metrics] = await Promise.all([
++        this.pageCall(
++          link,
++          { method: "Page.captureScreenshot", params: { format: "jpeg", quality: 70 } },
++          QUICK_TIMEOUT_MS,
++        ),
++        this.pageCall(link, { method: "Page.getLayoutMetrics", params: {} }, QUICK_TIMEOUT_MS),
++      ]);
+       const data = shot && isRecord(shot.result) && typeof shot.result.data === "string" ? shot.result.data : "";
+-      if (data) return sendShot(data);
++      const layout = metrics && isRecord(metrics.result) ? metrics.result.cssLayoutViewport : null;
++      if (data) return sendShot(data, isRecord(layout) ? pageSize(layout.clientWidth, layout.clientHeight) : null);
+       if (!waiting()) return;
+     }
+     const file = path.join(this.opts.home, "browser", `${session.name}-frame.jpg`);
+@@ -4347,7 +4403,11 @@ export class BrowserManager {
+           ["screenshot", file, "--screenshot-format", "jpeg", "--screenshot-quality", "70"],
+           { timeoutMs: QUICK_TIMEOUT_MS },
+         );
+-        sendShot(shot.success ? (await readFile(file)).toString("base64") : "");
++        if (!shot.success) return;
++        const seen = await this.run(session, ["eval", VIEWPORT], { timeoutMs: QUICK_TIMEOUT_MS });
++        const read = seen.success && isRecord(seen.data) ? seen.data.result : null;
++        const [width, height] = Array.isArray(read) ? read : [];
++        sendShot((await readFile(file)).toString("base64"), pageSize(width, height));
+       } finally {
+         await rm(file, { force: true }).catch(() => undefined);
+       }
+diff --git a/apps/server/test/runner/browser.test.ts b/apps/server/test/runner/browser.test.ts
+index 433cfdcdc..c4c481679 100644
+--- a/apps/server/test/runner/browser.test.ts
++++ b/apps/server/test/runner/browser.test.ts
+@@ -983,6 +983,15 @@ describe("a person takes control while the agent's pointer and keys are going",
+       });
+       // An idle page sends no frame: its first picture comes from the tab's socket too, not the held daemon.
+       await waitFor(() => t.frames.some((f) => f.type === "browser.frame" && f.seq === 0));
++      // It says the size the tab itself has (a narrow sign-in window), not the 1280 the stream's status says for
++      // any page: a click mapped with the wrong width lands elsewhere on the page.
++      expect(t.frames.find((f) => f.type === "browser.frame" && f.seq === 0)).toMatchObject({
++        metadata: { deviceWidth: 500, deviceHeight: 487 },
++      });
++      // So does a frame of the stream, which `agent-browser` labels 1280×720 whatever its picture shows.
++      const labelled = { deviceWidth: 1280, deviceHeight: 720 };
++      stream.push({ type: "frame", seq: 4, data: jpegOf(500, 487), metadata: labelled });
++      expect(t.frames.at(-1)).toMatchObject({ seq: 4, metadata: { deviceWidth: 500, deviceHeight: 487 } });
+       const startedAt = performance.now();
+       const res = await t.manager.input(dev, [
+         { kind: "mouse", type: "mouseMoved", x: 40, y: 50 },
+@@ -997,7 +1006,9 @@ describe("a person takes control while the agent's pointer and keys are going",
+       expect(took).toBeLessThan(300);
+       expect(relayed).toBe(0);
+       expect(pages.map((p) => p.url)).toEqual([`ws://127.0.0.1:${t.chromes[0]?.port}/devtools/page/AB12CD34`]);
+-      const calls = (pages[0] as FakePage).calls.filter((c) => c.method !== "Page.captureScreenshot");
++      const calls = (pages[0] as FakePage).calls.filter(
++        (c) => c.method !== "Page.captureScreenshot" && c.method !== "Page.getLayoutMetrics",
++      );
+       expect(calls).toEqual([
+         {
+           method: "Input.dispatchMouseEvent",
+@@ -1084,6 +1095,12 @@ describe("a person takes control while the agent's pointer and keys are going",
+   });
+ });
+ 
++/** The start of a JPEG of that size, in base64: all a frame's size is read from. */
++function jpegOf(width: number, height: number): string {
++  const head = [0xff, 0xd8, 0xff, 0xc0, 0x00, 0x11, 0x08, height >> 8, height & 0xff, width >> 8, width & 0xff, 0x03];
++  return Buffer.from([...head, ...new Array(12).fill(0)]).toString("base64");
++}
++
+ /** A tab's own DevTools socket (`connectPage`): records each call and answers it as Chrome does. */
+ class FakePage extends FakeSocket {
+   calls: { method: string; params: Record<string, unknown> }[] = [];
+@@ -1095,7 +1112,9 @@ class FakePage extends FakeSocket {
+         ? { result: { type: "boolean", value: true } }
+         : msg.method === "Page.captureScreenshot"
+           ? { data: Buffer.from("jpeg").toString("base64") }
+-          : {};
++          : msg.method === "Page.getLayoutMetrics"
++            ? { cssLayoutViewport: { pageX: 0, pageY: 0, clientWidth: 500, clientHeight: 487 } }
++            : {};
+     queueMicrotask(() => this.push({ id: msg.id, result }));
+   }
+ }
+@@ -2774,8 +2793,9 @@ test.if(posix)(
+       seq: 0,
+       data: expect.stringMatching(/^\/9j\//), // the JPEG the fake writes for a .jpg
+       metadata: {
++        // The page's own size (what it answers), not the 1280×720 the stream's status says.
+         deviceWidth: 1280,
+-        deviceHeight: 720,
++        deviceHeight: 800,
+         capturedAt: expect.any(Number),
+         url: "https://shop.example.com/",
+         title: "Loja",
+diff --git a/docs/adr/0040-agent-browser.md b/docs/adr/0040-agent-browser.md
+index 68534b818..3dbd3a1df 100644
+--- a/docs/adr/0040-agent-browser.md
++++ b/docs/adr/0040-agent-browser.md
+@@ -234,6 +234,14 @@ A person in control saw "this didn't reach the page" on a Cloudflare check: each
+ - The relay stays the fallback: no target known, or a socket that doesn't open within 1 s (tried again after 10 s). A call the tab's socket took isn't sent again on the relay.
+ - The socket closes with the stream, once the input queued on it has run. Nothing else changes: the agent's commands, frames and pacing stay on `agent-browser`.
+ 
++### 18. A frame says the size of the page it shows (2026-11-13)
++
++A person in control could type but not click: the page looked enlarged and every click landed elsewhere on it. `agent-browser` labels every frame of its stream 1280×720, and says the same in the stream's status, whatever the page's size: a sign-in window 500 pixels wide went out as 1280 wide, and the apps map a click on the picture with that width, so each landed 2.5 times too far right and down (measured with 0.39.1: a 1264×726 tab's frames say 1280×720).
++
++- A frame goes out with the size of its own picture, which is the page's on a screen of density 1 that fits the stream (headless, and the agents' desktops). While a person drives, the tab says its size itself (`Page.getLayoutMetrics` on its own socket, section 17), read once per tab and picture size, for screens where the picture is scaled.
++- The first picture of an idle page (a screenshot) says the size the page answers (`Page.getLayoutMetrics` on the tab's socket, else `window.innerWidth`/`innerHeight`), not the stream's status.
++- A picture that can't be read keeps the stream's label.
++
+ ## Order
+ 
+ First version: stages 0–7. Difficulty: **easy** (known pattern, little risk), **medium** (new pieces on known patterns).
+-- 
+2.43.0
+
